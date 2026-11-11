@@ -2,6 +2,7 @@
 Nova's abilities: laptop control, timers & reminders, smarter files & notes, AI brain.
 Keep this file next to assistant.py. The AI brain also needs:  pip install anthropic
 """
+import atexit
 import base64
 import ctypes
 import difflib
@@ -109,10 +110,139 @@ def open_path(p):
         return False
 
 
+_AUDIO_SCRIPT = r'''
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {
+    int RegisterControlChangeNotify(IntPtr pNotify);
+    int UnregisterControlChangeNotify(IntPtr pNotify);
+    int GetChannelCount(out uint pnChannelCount);
+    int SetMasterVolumeLevel(float fLevelDB, ref Guid pguidEventContext);
+    int SetMasterVolumeLevelScalar(float fLevel, ref Guid pguidEventContext);
+    int GetMasterVolumeLevel(out float pfLevelDB);
+    int GetMasterVolumeLevelScalar(out float pfLevel);
+    int SetChannelVolumeLevel(uint nChannel, float fLevelDB, ref Guid pguidEventContext);
+    int SetChannelVolumeLevelScalar(uint nChannel, float fLevel, ref Guid pguidEventContext);
+    int GetChannelVolumeLevel(uint nChannel, out float pfLevelDB);
+    int GetChannelVolumeLevelScalar(uint nChannel, out float pfLevel);
+    int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, ref Guid pguidEventContext);
+    int GetMute(out bool pbMute);
+}
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice {
+    int Activate(ref Guid id, int clsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+}
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator {
+    int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
+    int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppDevice);
+}
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumerator {}
+public class NovaAudio {
+    static IAudioEndpointVolume Ep() {
+        var e = (IMMDeviceEnumerator)(new MMDeviceEnumerator());
+        IMMDevice dev; e.GetDefaultAudioEndpoint(0, 0, out dev);
+        var iid = typeof(IAudioEndpointVolume).GUID;
+        object o; dev.Activate(ref iid, 23, IntPtr.Zero, out o);
+        return (IAudioEndpointVolume)o;
+    }
+    public static string Run(string cmd, int val) {
+        var ep = Ep();
+        var g = Guid.Empty;
+        float v; bool m;
+        if (cmd == "set") {
+            float lvl = Math.Max(0f, Math.Min(1f, val / 100f));
+            ep.SetMasterVolumeLevelScalar(lvl, ref g);
+        } else if (cmd == "delta") {
+            ep.GetMasterVolumeLevelScalar(out v);
+            float lvl = Math.Max(0f, Math.Min(1f, v + val / 100f));
+            ep.SetMasterVolumeLevelScalar(lvl, ref g);
+        } else if (cmd == "mute") {
+            if (val < 0) { ep.GetMute(out m); ep.SetMute(!m, ref g); }
+            else { ep.SetMute(val != 0, ref g); }
+        }
+        ep.GetMasterVolumeLevelScalar(out v);
+        ep.GetMute(out m);
+        return ((int)Math.Round(v * 100)) + "|" + (m ? "1" : "0");
+    }
+}
+"@
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::Out.WriteLine("ready"); [Console]::Out.Flush()
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    $parts = $line.Trim().Split(" ")
+    if ($parts.Length -ge 1 -and $parts[0] -ne "") {
+        try {
+            $v = if ($parts.Length -ge 2) { [int]$parts[1] } else { 0 }
+            [Console]::Out.WriteLine("ok:" + [NovaAudio]::Run($parts[0], $v))
+        } catch {
+            [Console]::Out.WriteLine("err:" + $_.Exception.Message)
+        }
+    } else {
+        [Console]::Out.WriteLine("err:empty")
+    }
+    [Console]::Out.Flush()
+}
+'''
+
+_audio_lock = threading.Lock()
+_audio_proc = None
+
+
+def close_audio():
+    global _audio_proc
+    if _audio_proc is not None:
+        try:
+            _audio_proc.stdin.close()
+            _audio_proc.terminate()
+        except Exception:
+            pass
+        _audio_proc = None
+
+
+atexit.register(close_audio)
+
+
+def _audio_cmd(cmd, val=0):
+    """Run a command on persistent Windows Core Audio COM helper; returns (pct, muted) or None."""
+    global _audio_proc
+    if not IS_WIN:
+        return None
+    with _audio_lock:
+        try:
+            if _audio_proc is None or _audio_proc.poll() is not None:
+                enc = base64.b64encode(_AUDIO_SCRIPT.encode("utf-16le")).decode()
+                _audio_proc = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, encoding="utf-8", bufsize=1, creationflags=NOWIN,
+                )
+                if _audio_proc.stdout.readline().strip() != "ready":
+                    close_audio()
+                    return None
+            _audio_proc.stdin.write(f"{cmd} {int(val)}\n")
+            _audio_proc.stdin.flush()
+            resp = _audio_proc.stdout.readline().strip()
+            if resp.startswith("ok:"):
+                p, m = resp[3:].split("|", 1)
+                return int(p), m == "1"
+        except Exception:
+            close_audio()
+    return None
+
+
 def volume_set(pct):
     if not IS_WIN:
         return WIN_ONLY
     pct = max(0, min(100, int(pct)))
+    res = _audio_cmd("set", pct)
+    if res is not None:
+        return f"Volume set to {res[0]} percent."
     press("down", times=50)
     press("up", times=pct // 2)
     return f"Volume set to {pct} percent."
@@ -121,8 +251,23 @@ def volume_set(pct):
 def volume_change(direction, pct=10):
     if not IS_WIN:
         return WIN_ONLY
-    press(direction, times=max(1, pct // 2))
+    delta = -abs(int(pct)) if direction == "down" else abs(int(pct))
+    res = _audio_cmd("delta", delta)
+    if res is not None:
+        return f"Volume at {res[0]} percent."
+    press(direction, times=max(1, abs(int(pct)) // 2))
     return f"Volume {direction}."
+
+
+def volume_mute(mute=None):
+    if not IS_WIN:
+        return WIN_ONLY
+    mode = -1 if mute is None else (1 if mute else 0)
+    res = _audio_cmd("mute", mode)
+    if res is not None:
+        return "Muted." if res[1] else f"Unmuted, volume at {res[0]} percent."
+    press("mute")
+    return "Done."
 
 
 def media(action):
@@ -339,22 +484,58 @@ class _SPS(ctypes.Structure):
                 ("sys", ctypes.c_ubyte), ("life", ctypes.c_ulong), ("full", ctypes.c_ulong)]
 
 
+class _MSE(ctypes.Structure):
+    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+def _battery_info():
+    if not IS_WIN:
+        return None
+    s = _SPS()
+    ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s))
+    return None if s.pct == 255 else (int(s.pct), s.ac == 1, int(s.life))
+
+
 def battery():
     if not IS_WIN:
         return WIN_ONLY
-    s = _SPS()
-    ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s))
-    if s.pct == 255:
+    info = _battery_info()
+    if not info:
         return "This computer doesn't seem to have a battery."
-    out = f"Your battery is at {s.pct} percent" + (" and charging." if s.ac == 1 else ".")
-    if s.ac != 1 and s.life != 0xFFFFFFFF:
-        out += f" About {s.life // 3600} hours {s.life % 3600 // 60} minutes left."
+    pct, charging, life = info
+    out = f"Your battery is at {pct} percent" + (" and charging." if charging else ".")
+    if not charging and life != 0xFFFFFFFF:
+        out += f" About {life // 3600} hours {life % 3600 // 60} minutes left."
     return out
 
 
 def disk_space():
     u = shutil.disk_usage(HOME.anchor or "/")
     return f"You have {u.free / 1e9:.0f} gigabytes free out of {u.total / 1e9:.0f}."
+
+
+def system_diagnostics():
+    """Live hardware summary: RAM, uptime, battery, and free disk space."""
+    parts = []
+    if IS_WIN:
+        m = _MSE()
+        m.dwLength = ctypes.sizeof(_MSE)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            total_gb = m.ullTotalPhys / (1024 ** 3)
+            used_gb = (m.ullTotalPhys - m.ullAvailPhys) / (1024 ** 3)
+            parts.append(f"Memory is at {m.dwMemoryLoad} percent, using {used_gb:.1f} of {total_gb:.0f} gigabytes.")
+        ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        up_s = ctypes.windll.kernel32.GetTickCount64() // 1000
+        h, rem = divmod(up_s, 3600)
+        parts.append(f"Uptime is {h} hours and {rem // 60} minutes.")
+        if _battery_info():
+            parts.append(battery())
+    parts.append(disk_space())
+    return " ".join(parts)
 
 
 def wifi():
@@ -464,10 +645,13 @@ def _load_rem():
         return []
 
 
-def add_reminder(due, text, kind):
+def add_reminder(due, text, kind, repeat_secs=0):
     with _lock:
         items = _load_rem()
-        items.append({"due": due, "text": text, "kind": kind})
+        entry = {"due": due, "text": text, "kind": kind}
+        if repeat_secs and repeat_secs > 0:
+            entry["repeat_secs"] = float(repeat_secs)
+        items.append(entry)
         REM_FILE.write_text(json.dumps(items))
 
 
@@ -480,17 +664,48 @@ def _alert_text(i, now):
     return ("Missed reminder: " if late else "Reminder: ") + i["text"] + "."
 
 
+_battery_warned = False
+
+
+def _check_proactive_battery():
+    global _battery_warned
+    info = _battery_info()
+    if not info:
+        return
+    pct, charging, _ = info
+    if charging or pct > 25:
+        _battery_warned = False
+    elif pct <= 15 and not _battery_warned:
+        _battery_warned = True
+        ctx.get("alert", lambda k, t: print(t))("battery", f"Heads up, your battery is down to {pct} percent.")
+
+
 def _scheduler():
+    ticks = 0
     while True:
         time.sleep(1)
+        ticks += 1
         try:
             with _lock:
                 items, now = _load_rem(), time.time()
-                due = [i for i in items if i["due"] <= now]
+                due, keep = [], []
+                for i in items:
+                    if i["due"] <= now:
+                        due.append(dict(i))
+                        rep = float(i.get("repeat_secs") or 0)
+                        if rep > 0:
+                            nxt = dict(i)
+                            while nxt["due"] <= now:
+                                nxt["due"] += rep
+                            keep.append(nxt)
+                    else:
+                        keep.append(i)
                 if due:
-                    REM_FILE.write_text(json.dumps([i for i in items if i["due"] > now]))
+                    REM_FILE.write_text(json.dumps(keep))
             for i in due:
                 ctx.get("alert", lambda k, t: print(t))(i["kind"], _alert_text(i, now))
+            if ticks % 30 == 0:
+                _check_proactive_battery()
         except Exception as err:
             print("scheduler error:", err)
 
@@ -512,19 +727,27 @@ def set_alarm(d):
 
 
 def _clean_msg(s):
-    s = re.sub(r"\b(?:remind me|set a reminder|set reminder|reminder|please|tomorrow)\b", " ", s)
+    s = re.sub(r"\b(?:remind me|set a reminder|set reminder|reminder|please|tomorrow|every day|daily)\b", " ", s)
+    s = re.sub(r"\bevery\b", " ", s)
     s = " ".join(s.split())
     return re.sub(r"^(?:to|that|about|for|of|and)\s+|\s+(?:to|at|in|on|for)$", "", s).strip()
 
 
 def set_reminder_from(t):
     """Returns a reply, or None if there is no time in the request (then it's just a task)."""
+    repeat_secs = 0
+    if re.search(r"\bevery (?:day|morning|evening|night)\b|\bdaily\b", t):
+        repeat_secs = 86400
     secs = parse_duration(t)
     if secs:
-        due, rest, when = time.time() + secs, DUR_STRIP.sub(" ", t), f"in {fmt_duration(secs)}"
+        if re.search(r"\bevery\b", t):
+            repeat_secs = secs
+        due, rest = time.time() + secs, DUR_STRIP.sub(" ", t)
+        when = (f"every {fmt_duration(repeat_secs)}" if repeat_secs else f"in {fmt_duration(secs)}")
     elif (c := parse_clock(t)):
         d, (a, b) = c
-        due, rest, when = d.timestamp(), t[:a] + " " + t[b:], clock_text(d)
+        due, rest = d.timestamp(), t[:a] + " " + t[b:]
+        when = (f"every day at {d.strftime('%I:%M %p').lstrip('0')}" if repeat_secs else clock_text(d))
     elif "tomorrow" in t:
         d = datetime.combine(datetime.now().date() + timedelta(days=1), dtime(9))
         due, rest, when = d.timestamp(), t, clock_text(d)
@@ -533,8 +756,8 @@ def set_reminder_from(t):
     text = _clean_msg(rest)
     if not text:
         return ctx["ask"]("What should I remind you about?",
-                          lambda x: (add_reminder(due, x, "reminder"), f"Okay, I'll remind you {when}.")[1])
-    add_reminder(due, text, "reminder")
+                          lambda x: (add_reminder(due, x, "reminder", repeat_secs), f"Okay, I'll remind you {when}.")[1])
+    add_reminder(due, text, "reminder", repeat_secs)
     return f"Okay, I'll remind you to {text} {when}."
 
 
@@ -546,7 +769,10 @@ def list_reminders(kind=None):
     for i in items[:5]:
         label = {"timer": "a timer", "alarm": "an alarm"}.get(i["kind"], f"a reminder to {i['text']}")
         left = i["due"] - now
-        parts.append(f"{label} {'in ' + fmt_duration(left) if left < 7200 else clock_text(datetime.fromtimestamp(i['due']))}")
+        when = "in " + fmt_duration(left) if left < 7200 else clock_text(datetime.fromtimestamp(i["due"]))
+        rep = float(i.get("repeat_secs") or 0)
+        rep_txt = f" (every {fmt_duration(rep)})" if rep > 0 else ""
+        parts.append(f"{label} {when}{rep_txt}")
     return "You have " + "; ".join(parts) + "."
 
 
@@ -958,8 +1184,8 @@ TOOLS = [
     _tool("set_volume", "Set the speaker volume from 0 to 100.", {"percent": "number"}),
     _tool("media_control", "Control media: play, pause, next or previous.", {"action": "string"}),
     _tool("set_timer", "Start a countdown timer.", {"seconds": "number"}),
-    _tool("set_reminder", "Speak a reminder to the user later.",
-          {"minutes_from_now": "number", "message": "string"}),
+    _tool("set_reminder", "Speak a reminder to the user later (optionally recurring).",
+          {"minutes_from_now": "number", "message": "string", "repeat_minutes?": "number"}),
     _tool("list_reminders", "List upcoming timers, alarms, or reminders.", {"kind?": "string"}),
     _tool("cancel_reminders", "Cancel active timers, alarms, or reminders.", {"kind?": "string"}),
     _tool("add_task", "Add an item to the to-do list.", {"text": "string"}),
@@ -978,6 +1204,7 @@ TOOLS = [
           {"question?": "string"}),
     _tool("get_weather", "Current weather; leave city empty for the user's own location.", {"city?": "string"}),
     _tool("system_status", "Battery level and free disk space.", {}),
+    _tool("system_diagnostics", "Detailed live diagnostics: RAM usage, uptime, battery, and disk space.", {}),
     _tool("take_screenshot", "Save a screenshot of the screen.", {}),
 ]
 FUNCS = {
@@ -986,8 +1213,10 @@ FUNCS = {
     "set_volume": lambda percent: volume_set(percent),
     "media_control": media,
     "set_timer": lambda seconds: set_timer(float(seconds)),
-    "set_reminder": lambda minutes_from_now, message: (
-        add_reminder(time.time() + float(minutes_from_now) * 60, message, "reminder"), "Reminder set.")[1],
+    "set_reminder": lambda minutes_from_now, message, repeat_minutes=0: (
+        add_reminder(time.time() + float(minutes_from_now) * 60, message, "reminder",
+                     float(repeat_minutes) * 60 if repeat_minutes else 0),
+        "Recurring reminder set." if repeat_minutes else "Reminder set.")[1],
     "list_reminders": lambda kind="": list_reminders(_norm_kind(kind)),
     "cancel_reminders": lambda kind="": cancel_reminders(_norm_kind(kind)),
     "add_task": lambda text: ctx["add_task"](text),
@@ -1004,6 +1233,7 @@ FUNCS = {
     "inspect_screen": inspect_screen,
     "get_weather": lambda city="": weather(city),
     "system_status": system_status,
+    "system_diagnostics": system_diagnostics,
     "take_screenshot": screenshot,
 }
 
@@ -1048,6 +1278,211 @@ def _http_json(url, payload=None, headers=None, timeout=30):
     except urllib.error.HTTPError as err:
         body = err.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {err.code}: {body[:300]}") from err
+
+
+def _http_stream(url, payload, headers=None, timeout=45):
+    """Yield decoded text lines from a streaming HTTP POST (SSE or NDJSON)."""
+    hdrs = {"User-Agent": "Nova/1.0", **(headers or {})}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=hdrs, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw in resp:
+                yield raw.decode("utf-8", errors="replace").rstrip("\r\n")
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {err.code}: {body[:300]}") from err
+
+
+class _SentenceEmitter:
+    """Incrementally buffers streamed LLM text tokens and emits complete spoken sentences."""
+
+    def __init__(self, emit):
+        self.emit = emit
+        self.buf = ""
+        self.all = []
+
+    def feed(self, token):
+        if not token:
+            return
+        self.all.append(token)
+        self.buf += token
+        while True:
+            m = re.match(r"^(.{24,}?[.!?])(?:\s+|\n+)(.*)$", self.buf, re.S)
+            if m and not re.search(r"\b\d+\.$", m.group(1)):
+                sent = " ".join(m.group(1).split())
+                self.buf = m.group(2)
+                if sent:
+                    self.emit(sent)
+                continue
+            if "\n" in self.buf:
+                head, _, rest = self.buf.partition("\n")
+                if len(head.strip()) >= 24:
+                    self.buf = rest
+                    self.emit(" ".join(head.split()))
+                    continue
+            if len(self.buf) >= 160:
+                cut = self.buf.rfind(" ", 80, 155)
+                if cut > 0:
+                    head = " ".join(self.buf[:cut].split())
+                    self.buf = self.buf[cut + 1:]
+                    if head:
+                        self.emit(head)
+                    continue
+            break
+
+    def flush(self):
+        rem = " ".join(self.buf.split())
+        self.buf = ""
+        if rem:
+            self.emit(rem)
+        return " ".join("".join(self.all).split()).strip() or "Done."
+
+
+def _ask_anthropic_stream(text, key, model, base_url, on_sentence, stop_event=None):
+    msgs = _history + [{"role": "user", "content": text}]
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    for _ in range(5):
+        emitter = _SentenceEmitter(on_sentence)
+        blocks = {}
+        stop_reason = None
+        for line in _http_stream(f"{base_url}/messages",
+                                 {"model": model, "max_tokens": 400, "system": _system(),
+                                  "tools": TOOLS, "messages": msgs, "stream": True}, headers):
+            if stop_event and stop_event.is_set():
+                return " ".join("".join(emitter.all).split()).strip()
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            ev = json.loads(raw)
+            t = ev.get("type")
+            if t == "content_block_start":
+                idx = ev["index"]
+                b = dict(ev["content_block"])
+                if b.get("type") == "tool_use":
+                    b["_raw_json"] = ""
+                blocks[idx] = b
+            elif t == "content_block_delta":
+                idx = ev["index"]
+                d = ev.get("delta", {})
+                if d.get("type") == "text_delta":
+                    emitter.feed(d.get("text", ""))
+                elif d.get("type") == "input_json_delta" and idx in blocks:
+                    blocks[idx]["_raw_json"] += d.get("partial_json", "")
+            elif t == "message_delta":
+                stop_reason = ev.get("delta", {}).get("stop_reason") or stop_reason
+        if stop_reason != "tool_use":
+            return emitter.flush()
+        full_blocks = []
+        results = []
+        for idx in sorted(blocks):
+            b = blocks[idx]
+            if b.get("type") == "tool_use":
+                raw_j = b.pop("_raw_json", "")
+                args = json.loads(raw_j) if raw_j.strip() else b.get("input", {})
+                b["input"] = args
+                full_blocks.append(b)
+                results.append({"type": "tool_result", "tool_use_id": b["id"], "content": _run_tool(b["name"], args)})
+            else:
+                full_blocks.append(b)
+        msgs.append({"role": "assistant", "content": full_blocks})
+        msgs.append({"role": "user", "content": results})
+    return "Done."
+
+
+def _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event=None):
+    msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    tools = _openai_tools()
+    use_tools = True
+    for _ in range(5):
+        payload = {"model": model, "messages": msgs, "max_tokens": 400, "stream": True}
+        if use_tools:
+            payload["tools"] = tools
+        emitter = _SentenceEmitter(on_sentence)
+        tool_acc = {}
+        try:
+            for line in _http_stream(f"{base_url}/chat/completions", payload, headers, timeout=45):
+                if stop_event and stop_event.is_set():
+                    return " ".join("".join(emitter.all).split()).strip()
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw or raw == "[DONE]":
+                    continue
+                ev = json.loads(raw)
+                choices = ev.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tool_acc.setdefault(idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+                if delta.get("content") and not tool_acc:
+                    emitter.feed(delta["content"])
+        except RuntimeError as err:
+            if use_tools and ("does not support tools" in str(err).lower() or ("tools" in str(err).lower() and "400" in str(err))):
+                use_tools = False
+                continue
+            raise
+        if not tool_acc:
+            return emitter.flush()
+        calls = [tool_acc[i] for i in sorted(tool_acc)]
+        msgs.append({"role": "assistant", "content": "".join(emitter.all) or None, "tool_calls": calls})
+        for tc in calls:
+            fn = tc["function"]
+            args_raw = fn.get("arguments") or "{}"
+            args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw.strip() else {}
+            msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": _run_tool(fn["name"], args)})
+    return "Done."
+
+
+def _ask_ollama_stream(text, model, base_url, on_sentence, stop_event=None):
+    msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
+    headers = {"Content-Type": "application/json"}
+    tools = _openai_tools()
+    use_tools = True
+    for _ in range(5):
+        payload = {"model": model, "messages": msgs, "stream": True}
+        if use_tools:
+            payload["tools"] = tools
+        emitter = _SentenceEmitter(on_sentence)
+        tool_calls = []
+        try:
+            for line in _http_stream(f"{base_url}/api/chat", payload, headers, timeout=60):
+                if stop_event and stop_event.is_set():
+                    return " ".join("".join(emitter.all).split()).strip()
+                if not line.strip():
+                    continue
+                ev = json.loads(line)
+                msg = ev.get("message") or {}
+                if msg.get("tool_calls"):
+                    tool_calls.extend(msg["tool_calls"])
+                elif msg.get("content") and not tool_calls:
+                    emitter.feed(msg["content"])
+        except RuntimeError as err:
+            if use_tools and "does not support tools" in str(err).lower():
+                use_tools = False
+                continue
+            raise
+        if not tool_calls:
+            return emitter.flush()
+        msgs.append({"role": "assistant", "content": "".join(emitter.all), "tool_calls": tool_calls})
+        for tc in tool_calls:
+            fn = tc["function"]
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                args = json.loads(args) if args.strip() else {}
+            msgs.append({"role": "tool", "content": _run_tool(fn["name"], args)})
+    return "Done."
 
 
 def _ask_anthropic(text, key, model, base_url):
@@ -1207,14 +1642,28 @@ def _ai_error_reply(provider, err):
     return "I couldn't reach my AI brain. Check your internet connection and API key."
 
 
-def ask_ai(text):
-    """Returns Nova's reply, or None if the AI brain isn't set up."""
+def ask_ai(text, on_sentence=None, stop_event=None):
+    """Returns Nova's reply, or None if the AI brain isn't set up. Streams sentences if on_sentence is given."""
     ready, provider, model = ai_status()
     if not ready:
         return None
     _, key, _, base_url = _ai_settings()
     try:
-        if provider == "anthropic":
+        if on_sentence is not None:
+            if provider == "anthropic":
+                reply = _ask_anthropic_stream(text, key, model, base_url, on_sentence, stop_event)
+            elif provider in ("openai", "ollama_cloud"):
+                reply = _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event)
+            elif provider == "ollama":
+                reply = _ask_ollama_stream(text, model, base_url, on_sentence, stop_event)
+            elif provider == "gemini":
+                reply = _ask_gemini(text, key, model, base_url)
+                em = _SentenceEmitter(on_sentence)
+                em.feed(reply)
+                em.flush()
+            else:
+                return f"Unknown AI provider: {provider}."
+        elif provider == "anthropic":
             reply = _ask_anthropic(text, key, model, base_url)
         elif provider in ("openai", "ollama_cloud"):
             reply = _ask_openai(text, key, model, base_url)
@@ -1224,15 +1673,20 @@ def ask_ai(text):
             reply = _ask_ollama(text, model, base_url)
         else:
             return f"Unknown AI provider: {provider}."
+        if stop_event and stop_event.is_set() and not reply:
+            return ""
         _history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
         del _history[:-8]
         m = _memory()
-        if m:
+        if m and reply:
             m.add_episode(text, reply)
         return reply
     except Exception as err:
         print("AI error:", err)
-        return _ai_error_reply(provider, err)
+        msg = _ai_error_reply(provider, err)
+        if on_sentence is not None and not (stop_event and stop_event.is_set()):
+            on_sentence(msg)
+        return msg
 
 
 def ask_ai_vision(question, image_b64, mime="image/jpeg"):
@@ -1450,10 +1904,7 @@ def route(t, raw):
 
     # --- volume, media, brightness ---
     if re.search(r"\b(un)?mute\b", t) and "timer" not in t:
-        if not IS_WIN:
-            return WIN_ONLY
-        press("mute")
-        return "Done."
+        return volume_mute(False if re.search(r"\bunmute\b", t) else True)
     if re.search(r"\bvolume\b|\blouder\b|\bquieter\b|\bsofter\b|\bturn (it|the (sound|music)) (up|down)\b", t):
         n, by = re.search(r"\b(\d{1,3})\b", t), re.search(r"\bby (\d{1,3})\b", t)
         up = re.search(r"\b(up|higher|increase|raise|louder)\b", t)
@@ -1521,6 +1972,8 @@ def route(t, raw):
         return disk_space()
     if re.search(r"\bwi ?fi\b", t):
         return wifi()
+    if re.search(r"\b(system diagnostics?|pc health|check my pc|memory usage|how much ram|uptime|how long has my (?:pc|laptop|computer) been on)\b", t):
+        return system_diagnostics()
     if re.search(r"\bsystem status\b", t):
         return system_status()
     if re.search(r"\b(weather|forecast|will it rain|is it going to rain)\b", t):

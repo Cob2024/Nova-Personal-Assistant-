@@ -299,6 +299,138 @@ class NovaTests(unittest.TestCase):
         self.assertEqual(mic.listen(wait=5), "open notepad")
         mic.model.transcribe.assert_called_once()
 
+    def test_sentence_emitter_and_streaming_ai(self):
+        emitted = []
+        em = nova_skills._SentenceEmitter(emitted.append)
+        for tok in ["1. First check ", "is running smoothly right now. ", "Second sentence ", "finishes cleanly here."]:
+            em.feed(tok)
+        full = em.flush()
+        self.assertEqual(emitted, [
+            "1. First check is running smoothly right now.",
+            "Second sentence finishes cleanly here.",
+        ])
+        self.assertIn("First check", full)
+
+        nova_skills.CONFIG_FILE.write_text(json.dumps({
+            "provider": "ollama_cloud", "api_key": "ol-key", "model": "deepseek-v4.1-flash"
+        }))
+        nova_skills.take_note("Streaming test note")
+        stream_turns = [
+            [
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"read_notes","arguments":"{\\"count\\": "}}]}}]}',
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}',
+                'data: [DONE]',
+            ],
+            [
+                'data: {"choices":[{"delta":{"content":"I checked your saved notes. "}}]}',
+                'data: {"choices":[{"delta":{"content":"Your latest note says Streaming test note."}}]}',
+                'data: [DONE]',
+            ],
+        ]
+        spoken = []
+        with mock.patch.object(nova_skills, "_http_stream", side_effect=[iter(t) for t in stream_turns]), \
+             mock.patch.object(assistant, "say", side_effect=spoken.append):
+            ended = assistant.respond("check my notes", stream=True)
+        self.assertFalse(ended)
+        self.assertEqual(spoken, [
+            "I checked your saved notes.",
+            "Your latest note says Streaming test note.",
+        ])
+
+    def test_anthropic_and_ollama_streaming(self):
+        nova_skills.CONFIG_FILE.write_text(json.dumps({
+            "provider": "anthropic", "api_key": "ant-key", "model": "claude-haiku-5-5"
+        }))
+        ant_lines = [
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Systems are completely nominal today. "}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Ready when you are."}}',
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+        ]
+        out = []
+        with mock.patch.object(nova_skills, "_http_stream", return_value=iter(ant_lines)):
+            reply = nova_skills.ask_ai("status report", on_sentence=out.append)
+        self.assertEqual(out, ["Systems are completely nominal today.", "Ready when you are."])
+        self.assertIn("Systems are completely nominal", reply)
+
+        nova_skills.CONFIG_FILE.write_text(json.dumps({"provider": "ollama", "model": "llama3.2"}))
+        ol_lines = [
+            json.dumps({"message": {"role": "assistant", "content": "Local stream is working nicely today. "}}),
+            json.dumps({"message": {"role": "assistant", "content": "No cloud required."}}),
+        ]
+        out2 = []
+        with mock.patch.object(nova_skills, "_http_stream", return_value=iter(ol_lines)):
+            reply2 = nova_skills.ask_ai("local check", on_sentence=out2.append)
+        self.assertEqual(out2, ["Local stream is working nicely today.", "No cloud required."])
+        self.assertIn("No cloud required.", reply2)
+
+    def test_core_audio_and_diagnostics(self):
+        with mock.patch.object(nova_skills, "_audio_cmd", return_value=(42, False)) as m:
+            self.assertEqual(nova_skills.volume_set(42), "Volume set to 42 percent.")
+            m.assert_called_with("set", 42)
+        with mock.patch.object(nova_skills, "_audio_cmd", return_value=(52, False)):
+            self.assertEqual(nova_skills.volume_change("up", 10), "Volume at 52 percent.")
+        with mock.patch.object(nova_skills, "_audio_cmd", return_value=(52, True)):
+            self.assertEqual(nova_skills.route("mute", "mute"), "Muted.")
+        with mock.patch.object(nova_skills, "_audio_cmd", return_value=None), \
+             mock.patch.object(nova_skills, "press") as p:
+            nova_skills.volume_mute(True)
+            p.assert_called_once_with("mute")
+        diag = assistant.handle("system diagnostics")
+        self.assertIn("gigabytes free", diag.lower())
+        if os.name == "nt":
+            self.assertIn("memory is at", diag.lower())
+            self.assertIn("uptime is", diag.lower())
+
+    def test_recurring_reminders_and_low_battery_guard(self):
+        r1 = assistant.handle("remind me every 30 minutes to drink water")
+        self.assertIn("every 30 minutes", r1.lower())
+        items = nova_skills._load_rem()
+        self.assertEqual(items[0]["repeat_secs"], 1800)
+        self.assertIn("every 30 minutes", nova_skills.list_reminders().lower())
+
+        r2 = assistant.handle("remind me every day at 9 am to stretch")
+        self.assertIn("every day at", r2.lower())
+        items = nova_skills._load_rem()
+        self.assertEqual(items[1]["repeat_secs"], 86400)
+
+        alerts = []
+        nova_skills._battery_warned = False
+        with mock.patch.dict(nova_skills.ctx, {"alert": lambda k, txt: alerts.append((k, txt))}), \
+             mock.patch.object(nova_skills, "_battery_info", return_value=(12, False, 1200)):
+            nova_skills._check_proactive_battery()
+            nova_skills._check_proactive_battery()     # must not spam
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0][0], "battery")
+        with mock.patch.object(nova_skills, "_battery_info", return_value=(50, True, 0)):
+            nova_skills._check_proactive_battery()
+        self.assertFalse(nova_skills._battery_warned)
+
+    def test_localhost_ipc_ask_wake_stop(self):
+        orig_port = assistant.IPC_PORT
+        orig_lock = assistant._lock
+        assistant.IPC_PORT = 47699
+        try:
+            self.assertFalse(assistant.already_running())
+            res = assistant.send_ipc({"op": "ask", "text": "what time is it", "speak": False})
+            self.assertTrue(res and res["ok"])
+            self.assertIn("It's", res["reply"])
+
+            assistant._wake_event.clear()
+            res2 = assistant.send_ipc({"op": "wake"})
+            self.assertTrue(res2 and res2["ok"])
+            self.assertTrue(assistant._wake_event.is_set())
+
+            assistant._stop_speech_event.clear()
+            res3 = assistant.send_ipc({"op": "stop"})
+            self.assertTrue(res3 and res3["ok"])
+            self.assertTrue(assistant._stop_speech_event.is_set())
+        finally:
+            if assistant._lock:
+                assistant._lock.close()
+            assistant._lock = orig_lock
+            assistant.IPC_PORT = orig_port
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

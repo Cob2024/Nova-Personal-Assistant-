@@ -6,12 +6,13 @@ Setup:  pip install faster-whisper sounddevice numpy pyttsx3
 Extras: pip install edge-tts sherpa-onnx pillow
 Run:    python assistant.py              (voice)
         python assistant.py --text       (typing, no microphone)
+        python assistant.py --ask "..."  (send one command to running Nova, or run standalone)
         python assistant.py --mictest    (check your microphone)
         python assistant.py --voicetest  (check that Nova can speak)
         python assistant.py --enroll     (only listen to your voice; needs sherpa-onnx)
         python assistant.py --background (hidden mode used at startup, logs to nova.log)
         python assistant.py --no-overlay (voice without the popup window)
-        python assistant.py --setup-ai   (connect Claude, OpenAI, Gemini, or local Ollama)
+        python assistant.py --setup-ai   (connect Claude, Ollama Cloud, OpenAI, Gemini, or local Ollama)
         python assistant.py --selftest   (check packages and Windows features)
 """
 import atexit
@@ -42,6 +43,8 @@ VOICE_ENGINE = "auto"    # "auto" = British neural voice + SAPI backup; "neural"
 VOICE_NAME = "en-GB-RyanNeural"
 VOICE_LOCK = True        # True = once enrolled (--enroll), ignore other people's voices
 HOTKEY = "ctrl+shift+space"  # global Windows hotkey to wake Nova or interrupt speech (None to disable)
+HOTKEY_ASK = "ctrl+shift+j"  # global Windows hotkey to open silent quick-ask bar (None to disable)
+IPC_PORT = 47653
 ISLAND_RENDERER = "auto"    # "auto" = smooth edges if possible; "classic" = simple window (use if the island misbehaves)
 ISLAND_PILL = False        # True = put the orb and text inside a black Dynamic Island pill; False = they float on your desktop
 SHOW_TEXT = False          # False = only the orb appears and Nova speaks its replies; True = also show what you said and the reply
@@ -109,6 +112,7 @@ _failed = set()
 _speech_lock = threading.Lock()
 _speaking = threading.Event()
 _wake_event = threading.Event()
+_stop_speech_event = threading.Event()
 _voice = None
 
 
@@ -120,7 +124,8 @@ def _get_voice():
 
 
 def stop_speaking():
-    """Interrupt any ongoing Nova speech immediately (hotkey or click)."""
+    """Interrupt any ongoing Nova speech and LLM stream immediately (hotkey or click)."""
+    _stop_speech_event.set()
     v = _voice
     if v is not None and hasattr(v, "stop"):
         v.stop()
@@ -437,7 +442,7 @@ def new_task(text):
     return add_task(text) if text else ask("Sure. What should the task say?", new_task)
 
 
-def handle(raw):
+def handle(raw, on_sentence=None, stop_event=None):
     global awaiting
     t = clean(raw)
     if not t:
@@ -519,7 +524,7 @@ def handle(raw):
 
     global _ai_hinted
     if skills and 2 <= len(t.split()) <= 200:
-        reply = skills.ask_ai(raw.strip())       # the AI brain handles anything I don't recognise
+        reply = skills.ask_ai(raw.strip(), on_sentence=on_sentence, stop_event=stop_event)
         if reply:
             return reply
     if 2 <= len(t.split()) <= 10:           # ignore one-word noise and long background chatter
@@ -567,11 +572,43 @@ def setup_skills():
 _ai_hinted = False
 
 
-def respond(text):
-    """Handle one utterance. Returns True if the conversation should end."""
+def respond(text, stream=True):
+    """Handle one utterance (streaming AI sentences into speech when stream=True). Returns True if session ends."""
     try:
-        reply = handle(text)
-        if reply:
+        _stop_speech_event.clear()
+        if not stream:
+            reply = handle(text)
+            if reply:
+                say(reply)
+            return False
+        q = queue.Queue()
+        spoken = []
+
+        def speaker():
+            while True:
+                item = q.get()
+                try:
+                    if item is None:
+                        return
+                    if not _stop_speech_event.is_set():
+                        say(item)
+                finally:
+                    q.task_done()
+
+        worker = threading.Thread(target=speaker, daemon=True)
+        worker.start()
+
+        def emit(sentence):
+            if sentence and not _stop_speech_event.is_set():
+                spoken.append(sentence)
+                q.put(sentence)
+
+        try:
+            reply = handle(text, on_sentence=emit, stop_event=_stop_speech_event)
+        finally:
+            q.put(None)
+            worker.join()
+        if not spoken and reply and not _stop_speech_event.is_set():
             say(reply)
         return False
     except EndSession as e:
@@ -1412,33 +1449,53 @@ def _parse_hotkey(spec):
     return (mods, vk) if vk else None
 
 
+def _launch_quick_ask():
+    py = Path(sys.executable)
+    exe = py.with_name("pythonw.exe")
+    exe = exe if exe.exists() else py
+    subprocess.Popen([str(exe), str(Path(__file__).resolve()), "--quick-ask-ui"],
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
 def _start_hotkey():
-    """Register a global Windows hotkey that stops Nova mid-speech or wakes listening."""
-    if os.name != "nt" or not HOTKEY:
+    """Register global Windows hotkeys to wake/interrupt Nova and open the quick-ask bar."""
+    if os.name != "nt":
         return
-    parsed = _parse_hotkey(HOTKEY)
-    if not parsed:
+    regs = []
+    for hid, spec in ((1, HOTKEY), (2, HOTKEY_ASK)):
+        parsed = _parse_hotkey(spec)
+        if parsed:
+            regs.append((hid, spec, parsed[0], parsed[1]))
+    if not regs:
         return
-    mods, vk = parsed
 
     def loop():
         import ctypes
         from ctypes import wintypes as wt
         u = ctypes.windll.user32
-        if not u.RegisterHotKey(None, 1, mods, vk):
-            print(f"   (hotkey {HOTKEY} could not be registered — may already be in use)")
+        active = []
+        for hid, spec, mods, vk in regs:
+            if u.RegisterHotKey(None, hid, mods, vk):
+                active.append(hid)
+                print(f"   (hotkey active: {spec})")
+            else:
+                print(f"   (hotkey {spec} could not be registered — may already be in use)")
+        if not active:
             return
-        print(f"   (hotkey active: {HOTKEY} to wake or interrupt Nova)")
         msg = wt.MSG()
         try:
             while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 if msg.message == 0x0312:             # WM_HOTKEY
-                    if _speaking.is_set():
-                        stop_speaking()
-                    else:
-                        _wake_event.set()
+                    if msg.wParam == 1:
+                        if _speaking.is_set():
+                            stop_speaking()
+                        else:
+                            _wake_event.set()
+                    elif msg.wParam == 2:
+                        _launch_quick_ask()
         finally:
-            u.UnregisterHotKey(None, 1)
+            for hid in active:
+                u.UnregisterHotKey(None, hid)
 
     threading.Thread(target=loop, daemon=True).start()
 
@@ -1548,7 +1605,7 @@ def run_text():
     say("Text mode. Type a command.")
     while True:
         try:
-            respond(input("\n> "))
+            respond(input("\n> "), stream=False)
         except (KeyboardInterrupt, EOFError):
             break
 
@@ -1564,18 +1621,148 @@ def setup_logging():
 
 
 _lock = None
+_ipc_lock = threading.Lock()
+
+
+def _ipc_handle(req):
+    op = req.get("op")
+    if op == "stop":
+        stop_speaking()
+        return {"ok": True}
+    if op == "wake":
+        _wake_event.set()
+        return {"ok": True}
+    if op == "ask":
+        text = (req.get("text") or "").strip()
+        if not text:
+            return {"ok": True, "reply": ""}
+        speak = bool(req.get("speak"))
+        if speak:
+            UI.post("wake")
+            UI.post("heard", text)
+        try:
+            with _ipc_lock:
+                reply = handle(text)
+        except EndSession as e:
+            reply = str(e)
+        except SystemExit as e:
+            reply = str(e)
+        if speak and reply:
+            threading.Thread(target=lambda r=reply: (say(r), UI.post("hide")), daemon=True).start()
+        elif speak:
+            UI.post("hide")
+        return {"ok": True, "reply": reply or ""}
+    return {"ok": False, "error": "unknown op"}
+
+
+def _ipc_serve():
+    while True:
+        try:
+            conn, _ = _lock.accept()
+        except OSError:
+            return
+        try:
+            conn.settimeout(5)
+            chunks = []
+            while True:
+                b = conn.recv(4096)
+                if not b:
+                    break
+                chunks.append(b)
+                if b"\n" in b:
+                    break
+            raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+            res = _ipc_handle(json.loads(raw)) if raw else {"ok": False, "error": "empty"}
+            conn.sendall((json.dumps(res) + "\n").encode("utf-8"))
+        except Exception as err:
+            try:
+                conn.sendall((json.dumps({"ok": False, "error": str(err)}) + "\n").encode("utf-8"))
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+
+def send_ipc(payload, timeout=30):
+    """Send a JSON command to an already-running Nova instance; returns dict or None if offline."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", IPC_PORT), timeout=1.0) as s:
+            s.settimeout(timeout)
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            buf = []
+            while True:
+                b = s.recv(4096)
+                if not b:
+                    break
+                buf.append(b)
+                if b"\n" in b:
+                    break
+            raw = b"".join(buf).decode("utf-8", errors="replace").strip()
+            return json.loads(raw) if raw else None
+    except OSError:
+        return None
 
 
 def already_running():
-    """Only one Nova at a time (so startup + manual launch don't double up)."""
+    """Only one Nova at a time, and serve local IPC commands on localhost."""
     global _lock
     import socket
     _lock = socket.socket()
     try:
-        _lock.bind(("127.0.0.1", 47653))
+        _lock.bind(("127.0.0.1", IPC_PORT))
+        _lock.listen(5)
+        threading.Thread(target=_ipc_serve, daemon=True).start()
         return False
     except OSError:
         return True
+
+
+def run_ask(query):
+    res = send_ipc({"op": "ask", "text": query, "speak": False})
+    if res is not None:
+        if res.get("reply"):
+            print(res["reply"])
+        return
+    setup_skills()
+    reply = handle(query)
+    if reply:
+        print(reply)
+
+
+def run_quick_ask_ui():
+    import tkinter as tk
+    root = tk.Tk()
+    root.title("Nova Quick Ask")
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.configure(bg="#14161f")
+    w, h = 520, 48
+    x = max(0, (root.winfo_screenwidth() - w) // 2)
+    root.geometry(f"{w}x{h}+{x}+24")
+
+    frame = tk.Frame(root, bg="#14161f", highlightbackground="#3b4363", highlightthickness=1)
+    frame.pack(fill="both", expand=True)
+    entry = tk.Entry(frame, bg="#14161f", fg="#ffffff", insertbackground="#ffffff",
+                     relief="flat", font=("Segoe UI", 12))
+    entry.pack(fill="both", expand=True, padx=14, pady=10)
+    entry.focus_force()
+
+    def submit(_event=None):
+        text = entry.get().strip()
+        root.destroy()
+        if not text:
+            return
+        res = send_ipc({"op": "ask", "text": text, "speak": True})
+        if res is None:
+            setup_skills()
+            reply = handle(text)
+            if reply:
+                say(reply)
+
+    entry.bind("<Return>", submit)
+    entry.bind("<Escape>", lambda _e: root.destroy())
+    root.mainloop()
 
 
 def start_voice():
@@ -1658,6 +1845,17 @@ def main():
         return
     if "--enroll" in sys.argv:
         run_enroll()
+        return
+    if "--quick-ask-ui" in sys.argv:
+        run_quick_ask_ui()
+        return
+    if "--ask" in sys.argv:
+        idx = sys.argv.index("--ask")
+        query = " ".join(sys.argv[idx + 1:]).strip()
+        if query:
+            run_ask(query)
+        else:
+            print('Usage: python assistant.py --ask "your command"')
         return
     if not any(f in sys.argv for f in ("--text", "--mictest", "--voicetest")) and already_running():
         print("Nova is already running.")
