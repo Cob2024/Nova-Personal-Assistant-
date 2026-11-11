@@ -1383,6 +1383,7 @@ def read_webpage(url):
 # ============ 4. AI brain, memory & screen awareness ============
 AI_MODEL_DEFAULT = "claude-haiku-5-5"
 AI_DEFAULTS = {
+    "openrouter": {"model": "openrouter/free", "base_url": "https://openrouter.ai/api/v1"},
     "anthropic": {"model": AI_MODEL_DEFAULT, "base_url": "https://api.anthropic.com/v1"},
     "ollama_cloud": {"model": "deepseek-v4.1-flash", "base_url": "https://ollama.com/v1"},
     "openai": {"model": "gpt-4o-mini", "base_url": "https://api.openai.com/v1"},
@@ -1390,7 +1391,7 @@ AI_DEFAULTS = {
     "ollama": {"model": "llama3.2", "base_url": "http://127.0.0.1:11434"},
 }
 AI_HINT = ("I can answer general questions once my AI brain is set up. "
-           "Run assistant.py with --setup-ai to connect Claude, Ollama Cloud, OpenAI, Gemini, or local Ollama.")
+           "Run assistant.py with --setup-ai or --customize to connect OpenRouter, Claude, Ollama Cloud, OpenAI, Gemini, or local Ollama.")
 _history = []
 _mem = None
 _AI_COOLDOWN_SECS = 600.0
@@ -1690,7 +1691,9 @@ def _ai_settings():
     provider = cfg.get("provider")
     key = cfg.get("api_key")
     if not provider:
-        if os.environ.get("ANTHROPIC_API_KEY") or key:
+        if os.environ.get("OPENROUTER_API_KEY"):
+            provider = "openrouter"
+        elif os.environ.get("ANTHROPIC_API_KEY") or key:
             provider = "anthropic"
         elif os.environ.get("OLLAMA_API_KEY"):
             provider = "ollama_cloud"
@@ -1701,6 +1704,7 @@ def _ai_settings():
         else:
             return None, None, None, None
     env_key = {
+        "openrouter": os.environ.get("OPENROUTER_API_KEY"),
         "anthropic": os.environ.get("ANTHROPIC_API_KEY"),
         "ollama_cloud": os.environ.get("OLLAMA_API_KEY"),
         "openai": os.environ.get("OPENAI_API_KEY"),
@@ -2024,9 +2028,24 @@ def _ask_anthropic_stream(text, key, model, base_url, on_sentence, stop_event=No
     return "Done."
 
 
+def _openai_headers(key, base_url=""):
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    if "openrouter.ai" in (base_url or "").lower():
+        headers["HTTP-Referer"] = "https://github.com/Cob2024/Nova-Personal-Assistant-"
+        headers["X-Title"] = get_assistant_name()
+    return headers
+
+
+def _tools_unsupported(err):
+    msg = str(err).lower()
+    if "does not support tools" in msg or "tool use" in msg or "function calling" in msg:
+        return True
+    return "tool" in msg and any(code in msg for code in ("400", "404", "422"))
+
+
 def _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event=None):
     msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    headers = _openai_headers(key, base_url)
     tools = _openai_tools()
     use_tools = True
     for _ in range(5):
@@ -2062,7 +2081,7 @@ def _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event=None)
                 if delta.get("content") and not tool_acc:
                     emitter.feed(delta["content"])
         except RuntimeError as err:
-            if use_tools and ("does not support tools" in str(err).lower() or ("tools" in str(err).lower() and "400" in str(err))):
+            if use_tools and _tools_unsupported(err):
                 use_tools = False
                 continue
             raise
@@ -2161,7 +2180,7 @@ def _openai_tools():
 
 def _ask_openai(text, key, model, base_url):
     msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    headers = _openai_headers(key, base_url)
     tools = _openai_tools()
     use_tools = True
     for _ in range(5):
@@ -2171,7 +2190,7 @@ def _ask_openai(text, key, model, base_url):
         try:
             r = _http_json(f"{base_url}/chat/completions", payload, headers, timeout=45)
         except RuntimeError as err:
-            if use_tools and ("does not support tools" in str(err).lower() or ("tools" in str(err).lower() and "400" in str(err))):
+            if use_tools and _tools_unsupported(err):
                 use_tools = False
                 continue
             raise
@@ -2295,7 +2314,7 @@ def ask_ai(text, on_sentence=None, stop_event=None):
         if on_sentence is not None:
             if provider == "anthropic":
                 reply = _ask_anthropic_stream(text, key, model, base_url, on_sentence, stop_event)
-            elif provider in ("openai", "ollama_cloud"):
+            elif provider in ("openai", "ollama_cloud", "openrouter"):
                 reply = _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event)
             elif provider == "ollama":
                 reply = _ask_ollama_stream(text, model, base_url, on_sentence, stop_event)
@@ -2308,7 +2327,7 @@ def ask_ai(text, on_sentence=None, stop_event=None):
                 return f"Unknown AI provider: {provider}."
         elif provider == "anthropic":
             reply = _ask_anthropic(text, key, model, base_url)
-        elif provider in ("openai", "ollama_cloud"):
+        elif provider in ("openai", "ollama_cloud", "openrouter"):
             reply = _ask_openai(text, key, model, base_url)
         elif provider == "gemini":
             reply = _ask_gemini(text, key, model, base_url)
@@ -2351,7 +2370,7 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
                 ]}],
             }, {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
             reply = " ".join(b.get("text", "") for b in r.get("content", []) if b.get("type") == "text").strip() or "Done."
-        elif provider in ("openai", "ollama_cloud"):
+        elif provider in ("openai", "ollama_cloud", "openrouter"):
             r = _http_json(f"{base_url}/chat/completions", {
                 "model": model, "max_tokens": 400,
                 "messages": [
@@ -2361,7 +2380,7 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
                     ]},
                 ],
-            }, {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, timeout=45)
+            }, _openai_headers(key, base_url), timeout=45)
             reply = (r["choices"][0]["message"].get("content") or "").strip() or "Done."
         elif provider == "gemini":
             url = f"{base_url}/models/{urllib.parse.quote(model)}:generateContent"
@@ -2398,14 +2417,15 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
 
 def setup_ai():
     import getpass
-    print("Choose Nova's AI brain:")
-    print("  1) Anthropic Claude (API key)")
-    print("  2) Ollama Cloud (https://ollama.com/v1, e.g. deepseek-v4.1-flash)")
-    print("  3) OpenAI / OpenAI-compatible (OpenAI, Groq, OpenRouter, etc.)")
-    print("  4) Google Gemini (API key)")
-    print("  5) Local Ollama (free, offline, no API key needed)")
-    choice = (input("Pick 1-5 [2]: ").strip() or "2")
-    providers = {"1": "anthropic", "2": "ollama_cloud", "3": "openai", "4": "gemini", "5": "ollama"}
+    print(f"Choose {get_assistant_name()}'s AI brain:")
+    print("  1) OpenRouter (https://openrouter.ai/api/v1, free & paid models)")
+    print("  2) Anthropic Claude (API key)")
+    print("  3) Ollama Cloud (https://ollama.com/v1, e.g. deepseek-v4.1-flash)")
+    print("  4) OpenAI / OpenAI-compatible (OpenAI, Groq, etc.)")
+    print("  5) Google Gemini (API key)")
+    print("  6) Local Ollama (free, offline, no API key needed)")
+    choice = (input("Pick 1-6 [1]: ").strip() or "1")
+    providers = {"1": "openrouter", "2": "anthropic", "3": "ollama_cloud", "4": "openai", "5": "gemini", "6": "ollama"}
     provider = providers.get(choice)
     if not provider:
         print("Invalid choice.")
@@ -2431,6 +2451,7 @@ def setup_ai():
         cfg.pop("api_key", None)
     else:
         hints = {
+            "openrouter": "https://openrouter.ai/keys (or set OPENROUTER_API_KEY)",
             "anthropic": "https://console.anthropic.com",
             "ollama_cloud": "https://ollama.com/settings/keys (or set OLLAMA_API_KEY)",
             "openai": "https://platform.openai.com/api-keys",
@@ -2442,7 +2463,7 @@ def setup_ai():
             print("No key entered.")
             return
         cfg["api_key"] = key
-        if provider in ("openai", "ollama_cloud"):
+        if provider in ("openrouter", "openai", "ollama_cloud"):
             base_url = input(f"Base URL [{defaults['base_url']}]: ").strip() or defaults["base_url"]
             cfg["base_url"] = base_url.rstrip("/")
         else:

@@ -1973,13 +1973,23 @@ def run_customize_ui():
     p_col = tk.Frame(arow, bg="#14161f")
     p_col.pack(side="left", fill="x", expand=True, padx=(0, 6))
     lbl(p_col, "AI Provider (optional)").pack(fill="x")
-    ttk.Combobox(p_col, textvariable=v_prov,
-                 values=("none", "ollama_cloud", "anthropic", "openai", "gemini", "ollama"),
-                 state="readonly").pack(fill="x", pady=2)
+    p_box = ttk.Combobox(p_col, textvariable=v_prov,
+                         values=("none", "openrouter", "ollama_cloud", "anthropic", "openai", "gemini", "ollama"),
+                         state="readonly")
+    p_box.pack(fill="x", pady=2)
     m_col = tk.Frame(arow, bg="#14161f")
     m_col.pack(side="left", fill="x", expand=True, padx=(6, 0))
     lbl(m_col, "Model (optional)").pack(fill="x")
     ent(m_col, v_model).pack(fill="x", pady=2, ipady=3)
+
+    def _on_provider_pick(_evt=None):
+        p = v_prov.get().strip()
+        if p in skills.AI_DEFAULTS:
+            v_model.set(skills.AI_DEFAULTS[p]["model"])
+        elif p == "none":
+            v_model.set("")
+
+    p_box.bind("<<ComboboxSelected>>", _on_provider_pick)
 
     lbl(body, "API Key (leave blank to keep existing key)").pack(fill="x")
     ent(body, v_key, show="*").pack(fill="x", pady=(2, 10), ipady=4)
@@ -1999,15 +2009,22 @@ def run_customize_ui():
         new_cfg = skills._config()
         prov = v_prov.get().strip()
         if prov and prov != "none":
+            prev_prov = new_cfg.get("provider")
             new_cfg["provider"] = prov
+            if prev_prov and prev_prov != prov:
+                new_cfg.pop("base_url", None)
             if v_model.get().strip():
                 new_cfg["model"] = v_model.get().strip()
+            else:
+                new_cfg.pop("model", None)
             if v_key.get().strip():
                 new_cfg["api_key"] = v_key.get().strip()
             skills.reset_ai_cooldown()
         elif prov == "none":
             new_cfg.pop("provider", None)
             new_cfg.pop("api_key", None)
+            new_cfg.pop("base_url", None)
+            new_cfg.pop("model", None)
         skills._save_config(new_cfg)
         if os.name == "nt":
             try:

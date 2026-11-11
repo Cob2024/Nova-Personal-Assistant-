@@ -84,6 +84,23 @@ class NovaTests(unittest.TestCase):
             self.assertEqual(nova_skills.ai_status(), (True, "gemini", "gemini-2.5-flash"))
         with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "oa-key"}, clear=True):
             self.assertEqual(nova_skills.ai_status(), (True, "openai", "gpt-4o-mini"))
+        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-test", "OLLAMA_API_KEY": "ol-key"}, clear=True):
+            self.assertEqual(nova_skills.ai_status(), (True, "openrouter", "openrouter/free"))
+            self.assertEqual(nova_skills._ai_settings()[3], "https://openrouter.ai/api/v1")
+
+    def test_openrouter_headers_and_404_tools_fallback(self):
+        with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "sk-or-test"}, clear=True), \
+             mock.patch.object(nova_skills, "_http_json", side_effect=[
+                 RuntimeError("HTTP 404: No endpoints found that support tool use"),
+                 {"choices": [{"message": {"content": "OpenRouter works."}}]},
+             ]) as m:
+            reply = assistant.handle("explain gravity simply")
+        self.assertEqual(reply, "OpenRouter works.")
+        self.assertEqual(m.call_count, 2)
+        self.assertEqual(m.call_args_list[0].args[0], "https://openrouter.ai/api/v1/chat/completions")
+        self.assertIn("HTTP-Referer", m.call_args_list[0].args[2])
+        self.assertIn("tools", m.call_args_list[0].args[1])
+        self.assertNotIn("tools", m.call_args_list[1].args[1])
 
     def test_new_tools_execution(self):
         nova_skills.take_note("Buy coffee beans")
