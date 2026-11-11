@@ -2049,7 +2049,7 @@ def _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event=None)
     tools = _openai_tools()
     use_tools = True
     for _ in range(5):
-        payload = {"model": model, "messages": msgs, "max_tokens": 400, "stream": True}
+        payload = {"model": model, "messages": msgs, "max_tokens": 900, "stream": True}
         if use_tools:
             payload["tools"] = tools
         emitter = _SentenceEmitter(on_sentence)
@@ -2184,7 +2184,7 @@ def _ask_openai(text, key, model, base_url):
     tools = _openai_tools()
     use_tools = True
     for _ in range(5):
-        payload = {"model": model, "messages": msgs, "max_tokens": 400}
+        payload = {"model": model, "messages": msgs, "max_tokens": 900}
         if use_tools:
             payload["tools"] = tools
         try:
