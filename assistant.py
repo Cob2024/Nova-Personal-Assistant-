@@ -247,9 +247,21 @@ class Mic:
         self.np = np
         self.voice_lock = voice_lock
         self.model = WhisperModel(MODEL, compute_type="int8")
-        self.stream = sd.InputStream(samplerate=self.sr, channels=1,
-                                     dtype="float32", device=MIC_DEVICE)
-        self.stream.start()
+        for attempt in range(3):
+            try:
+                self.stream = sd.InputStream(samplerate=self.sr, channels=1,
+                                             dtype="float32", device=MIC_DEVICE)
+                self.stream.start()
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                except Exception:
+                    pass
+                time.sleep(0.8)
         self.ambient = min(0.015, self._level(self.stream.read(self.sr)[0]))   # room noise
         try:
             from faster_whisper.vad import get_vad_model
