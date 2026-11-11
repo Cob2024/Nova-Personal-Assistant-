@@ -158,9 +158,8 @@ def window_action(action):
 def open_path(p):
     try:
         if IS_WIN:
-            os.startfile(str(p))
-        else:
-            subprocess.Popen(["xdg-open", str(p)])
+            return launch(str(p))
+        subprocess.Popen(["xdg-open", str(p)])
         return True
     except OSError:
         return False
@@ -733,11 +732,21 @@ def empty_recycle_bin():
 
 
 def launch(target, arg=""):
-    """Launch an app, URI, shortcut, or file visibly with SW_SHOWNORMAL and zero modal UI popups."""
+    """Launch an app, URI, shortcut, or file visibly with COM STA + SW_SHOWNORMAL and zero modal UI popups."""
     if not IS_WIN:
         return False
+    ole32 = ctypes.windll.ole32
+    hr = -1
+    try:
+        hr = int(ole32.CoInitializeEx(None, 2 | 4))   # COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE
+    except Exception:
+        pass
     try:
         from ctypes import wintypes as wt
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)   # ASFW_ANY
+        except Exception:
+            pass
 
         class _SEI(ctypes.Structure):
             _fields_ = [
@@ -767,6 +776,12 @@ def launch(target, arg=""):
             return ps("Start-Process $env:NOVA_ARG -ErrorAction Stop", NOVA_ARG=target).returncode == 0
         except Exception:
             return False
+    finally:
+        if hr in (0, 1):
+            try:
+                ole32.CoUninitialize()
+            except Exception:
+                pass
 
 
 def play_spotify(query=""):
