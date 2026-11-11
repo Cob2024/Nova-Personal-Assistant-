@@ -733,15 +733,40 @@ def empty_recycle_bin():
 
 
 def launch(target, arg=""):
+    """Launch an app, URI, shortcut, or file visibly with SW_SHOWNORMAL and zero modal UI popups."""
     if not IS_WIN:
         return False
     try:
-        if arg:
-            return ps("Start-Process $env:NOVA_ARG -ArgumentList $env:NOVA_ARG2 -ErrorAction Stop",
-                      NOVA_ARG=target, NOVA_ARG2=arg).returncode == 0
-        return ps("Start-Process $env:NOVA_ARG -ErrorAction Stop", NOVA_ARG=target).returncode == 0
+        from ctypes import wintypes as wt
+
+        class _SEI(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wt.DWORD), ("fMask", wt.ULONG), ("hwnd", wt.HWND),
+                ("lpVerb", wt.LPCWSTR), ("lpFile", wt.LPCWSTR), ("lpParameters", wt.LPCWSTR),
+                ("lpDirectory", wt.LPCWSTR), ("nShow", ctypes.c_int), ("hInstApp", wt.HINSTANCE),
+                ("lpIDList", ctypes.c_void_p), ("lpClass", wt.LPCWSTR), ("hkeyClass", wt.HKEY),
+                ("dwHotKey", wt.DWORD), ("hIcon", wt.HANDLE), ("hProcess", wt.HANDLE),
+            ]
+
+        fn = ctypes.windll.shell32.ShellExecuteExW
+        fn.argtypes = [ctypes.POINTER(_SEI)]
+        fn.restype = wt.BOOL
+        sei = _SEI()
+        sei.cbSize = ctypes.sizeof(_SEI)
+        sei.fMask = 0x00000400                     # SEE_MASK_FLAG_NO_UI: no modal error popups
+        sei.lpVerb = "open"
+        sei.lpFile = str(target)
+        sei.lpParameters = str(arg) if arg else None
+        sei.nShow = 1                              # SW_SHOWNORMAL: show window visibly
+        return bool(fn(ctypes.byref(sei)))
     except Exception:
-        return False
+        try:
+            if arg:
+                return ps("Start-Process $env:NOVA_ARG -ArgumentList $env:NOVA_ARG2 -ErrorAction Stop",
+                          NOVA_ARG=target, NOVA_ARG2=arg).returncode == 0
+            return ps("Start-Process $env:NOVA_ARG -ErrorAction Stop", NOVA_ARG=target).returncode == 0
+        except Exception:
+            return False
 
 
 def play_spotify(query=""):
