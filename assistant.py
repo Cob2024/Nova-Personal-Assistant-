@@ -260,7 +260,7 @@ class Mic:
                 pre.append(block)
                 if time.time() - t0 > wait:
                     return ""
-        if loud < 2:                         # a click or a cough, not speech
+        if loud < 3:                         # a click or a cough, not speech
             return ""
         audio = np.concatenate(chunks).flatten()
         if self.voice_lock and self.voice_lock.ready and voice_mod:
@@ -1184,6 +1184,7 @@ class TkOverlay(IslandCore):
         self.cv = tk.Canvas(r, width=self.WIN_W, height=self.WIN_H, bg="#010101", highlightthickness=0)
         self.cv.pack()
         self.cv.bind("<Button-1>", lambda e: self.post("hide_now"))
+        self.cv.bind("<Button-3>", lambda e: _launch_quick_ask())
         try:                                                       # real font metrics, so text wraps exactly
             from tkinter import font as tkfont
             self.tkfonts = {k: tkfont.Font(root=r, family=f[0], size=f[1], weight=f[2]) for k, f in self.fonts.items()}
@@ -1303,8 +1304,11 @@ class WinOverlay(PilRender, IslandCore):
             fn.argtypes, fn.restype = args, res
 
         def proc(hwnd, msg, wparam, lparam):
-            if msg == 0x0201:                                      # click on the island dismisses it
+            if msg == 0x0201:                                      # left click dismisses / stops speech
                 self.post("hide_now")
+                return 0
+            if msg == 0x0205:                                      # right click opens quick-ask bar
+                _launch_quick_ask()
                 return 0
             return u.DefWindowProcW(hwnd, msg, wparam, lparam)
         self._proc = WNDPROC(proc)                                 # keep a reference so it isn't garbage collected

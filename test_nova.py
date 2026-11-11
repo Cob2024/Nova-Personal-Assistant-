@@ -431,6 +431,53 @@ class NovaTests(unittest.TestCase):
             assistant._lock = orig_lock
             assistant.IPC_PORT = orig_port
 
+    def test_webpage_reader_and_skip_dirs(self):
+        self.assertIn("http or https", nova_skills.read_webpage("file:///etc/passwd").lower())
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+            def read(self, n):
+                return b"<html><head><style>x{}</style><script>bad()</script></head><body><h1>Nova</h1><p>Hello world.</p></body></html>"
+
+        with mock.patch("urllib.request.urlopen", return_value=FakeResp()):
+            txt = nova_skills.read_webpage("https://example.com")
+        self.assertEqual(txt, "Nova Hello world.")
+
+        doc_dir = Path(self.tmp.name) / "Documents"
+        nm_dir = doc_dir / "node_modules" / "pkg"
+        real_dir = doc_dir / "work"
+        nm_dir.mkdir(parents=True)
+        real_dir.mkdir(parents=True)
+        (nm_dir / "invoice.txt").write_text("skip")
+        (real_dir / "invoice_real.txt").write_text("keep")
+        orig_home, orig_dirs = nova_skills.HOME, nova_skills.SEARCH_DIRS
+        try:
+            nova_skills.HOME = Path(self.tmp.name)
+            nova_skills.SEARCH_DIRS = ("Documents",)
+            hits = nova_skills.search_files(["invoice"])
+            self.assertEqual([h.name for h in hits], ["invoice_real.txt"])
+        finally:
+            nova_skills.HOME, nova_skills.SEARCH_DIRS = orig_home, orig_dirs
+
+    def test_top_processes_dynamic_close_and_briefing(self):
+        sample_procs = [("chrome.exe", "1", 512000), ("CustomApp.exe", "2", 102400)]
+        with mock.patch.object(nova_skills, "_running_procs", return_value=sample_procs):
+            top = assistant.handle("what's using the most memory")
+            self.assertIn("chrome", top.lower())
+            with mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)) as r:
+                res = assistant.handle("close customapp")
+                self.assertEqual(res, "Closing customapp.")
+                r.assert_called_once()
+                self.assertEqual(r.call_args.args[0], ["taskkill", "/IM", "CustomApp.exe"])
+
+        with mock.patch.object(nova_skills, "_battery_info", return_value=(20, False, 1800)), \
+             mock.patch.object(nova_skills, "weather", return_value="Clear, 22 degrees."):
+            b = nova_skills.briefing()
+            self.assertIn("20 percent and unplugged", b.lower())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

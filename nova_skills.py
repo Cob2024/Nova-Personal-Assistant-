@@ -4,8 +4,10 @@ Keep this file next to assistant.py. The AI brain also needs:  pip install anthr
 """
 import atexit
 import base64
+import csv
 import ctypes
 import difflib
+from html.parser import HTMLParser
 import io
 import json
 import os
@@ -387,10 +389,47 @@ def open_start_app(key):
     return hit[0]
 
 
+def _running_procs():
+    """Return list of (exe, pid, mem_kb) from Windows tasklist."""
+    if not IS_WIN:
+        return []
+    r = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                       stdin=subprocess.DEVNULL, creationflags=NOWIN)
+    procs = []
+    for row in csv.reader(r.stdout.splitlines()):
+        if len(row) < 5:
+            continue
+        exe, pid = row[0].strip(), row[1].strip()
+        mem_nums = re.sub(r"[^\d]", "", row[4])
+        procs.append((exe, pid, int(mem_nums) if mem_nums else 0))
+    return procs
+
+
+def top_processes(n=3):
+    """Report the apps using the most RAM right now."""
+    if not IS_WIN:
+        return WIN_ONLY
+    totals = {}
+    for exe, _, kb in _running_procs():
+        name = re.sub(r"\.exe$", "", exe, flags=re.I)
+        if name.lower() in ("memory compression", "system", "idle"):
+            continue
+        totals[name] = totals.get(name, 0) + kb
+    ranked = sorted(totals.items(), key=lambda x: x[1], reverse=True)[:max(1, int(n))]
+    if not ranked:
+        return "I couldn't inspect running apps."
+    parts = [f"{name} at {kb / 1024:.0f} megabytes" for name, kb in ranked]
+    return "Top memory users are " + ", ".join(parts) + "."
+
+
 def close_app(name):
     if not IS_WIN:
         return None
-    exe = _lookup(PROCS, name.strip().lower(), 0.8)
+    raw = name.strip().lower()
+    exe = _lookup(PROCS, raw, 0.8)
+    if not exe:
+        running = {re.sub(r"\.exe$", "", p[0], flags=re.I).lower(): p[0] for p in _running_procs()}
+        exe = running.get(raw) or next((v for k, v in running.items() if raw in k), None)
     if not exe:
         return None
     r = subprocess.run(["taskkill", "/IM", exe], capture_output=True, text=True,
@@ -804,11 +843,14 @@ def qwords(query):
     return [w for w in re.split(r"\W+", query.lower()) if w and w not in STOP]
 
 
+SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "site-packages", "target", "dist", "build", "appdata"}
+
+
 def search_files(words, limit=20):
     hits, deadline = [], time.time() + 5
     for base in SEARCH_DIRS:
         for root, dirs, files in os.walk(HOME / base):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in SKIP_DIRS]
             for f in files:
                 if all(w in re.sub(r"[_\-.]+", " ", f.lower()) for w in words):
                     hits.append(Path(root) / f)
@@ -937,6 +979,7 @@ def biggest(n=3):
     sizes, deadline = [], time.time() + 6
     for base in ("Downloads", "Documents", "Desktop", "Videos", "Pictures"):
         for root, dirs, files in os.walk(HOME / base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in SKIP_DIRS]
             for f in files:
                 try:
                     sizes.append((os.path.getsize(os.path.join(root, f)), Path(root) / f))
@@ -978,8 +1021,49 @@ def briefing():
     todays = [i for i in _load_rem() if i["kind"] != "timer" and i["due"] < end]
     if todays:
         out.append(f"{len(todays)} reminder{'s' * (len(todays) != 1)} or alarm{'s' * (len(todays) != 1)} today.")
+    info = _battery_info()
+    if info and not info[1] and info[0] <= 30:
+        out.append(f"Your battery is at {info[0]} percent and unplugged.")
     out.append(weather(short=True))
     return " ".join(x for x in out if x)
+
+
+class _TextHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._skip = 0
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript", "svg"):
+            self._skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "svg") and self._skip:
+            self._skip -= 1
+
+    def handle_data(self, data):
+        if not self._skip:
+            s = " ".join(data.split())
+            if s:
+                self.parts.append(s)
+
+
+def read_webpage(url):
+    """Fetch an http/https webpage and extract clean readable text (up to 4000 chars)."""
+    u = url.strip()
+    if not u.startswith(("http://", "https://")):
+        return "I can only read http or https web links."
+    try:
+        req = urllib.request.Request(u, headers={"User-Agent": "Nova/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read(250_000).decode("utf-8", errors="replace")
+        parser = _TextHTMLParser()
+        parser.feed(raw)
+        text = " ".join(parser.parts)
+        return text[:4000] if text else "The page had no readable text."
+    except Exception as err:
+        return f"I couldn't read that page ({err})."
 
 
 # ============ 4. AI brain, memory & screen awareness ============
@@ -1205,6 +1289,8 @@ TOOLS = [
     _tool("get_weather", "Current weather; leave city empty for the user's own location.", {"city?": "string"}),
     _tool("system_status", "Battery level and free disk space.", {}),
     _tool("system_diagnostics", "Detailed live diagnostics: RAM usage, uptime, battery, and disk space.", {}),
+    _tool("top_processes", "List the running apps using the most RAM.", {"count?": "number"}),
+    _tool("read_webpage", "Fetch readable text from an http or https URL.", {"url": "string"}),
     _tool("take_screenshot", "Save a screenshot of the screen.", {}),
 ]
 FUNCS = {
@@ -1234,6 +1320,8 @@ FUNCS = {
     "get_weather": lambda city="": weather(city),
     "system_status": system_status,
     "system_diagnostics": system_diagnostics,
+    "top_processes": lambda count=3: top_processes(int(count)),
+    "read_webpage": read_webpage,
     "take_screenshot": screenshot,
 }
 
@@ -1972,6 +2060,17 @@ def route(t, raw):
         return disk_space()
     if re.search(r"\bwi ?fi\b", t):
         return wifi()
+    if re.search(r"\b(summari[sz]e|read|explain)\b.*\b(link|url|webpage|web page|article)\b", t):
+        m = re.search(r"https?://\S+", raw)
+        url = m.group(0) if m else clipboard().strip()
+        if not url.startswith(("http://", "https://")):
+            return "Copy a link to your clipboard or include the URL, and I'll read it."
+        page = read_webpage(url)
+        if not ai_ready():
+            return page[:300]
+        return ask_ai(f"Summarize this webpage concisely in two or three spoken sentences:\n\n{page}")
+    if re.search(r"\b(top (?:apps|processes)|using (?:the )?most (?:ram|memory)|slowing down my (?:pc|laptop|computer))\b", t):
+        return top_processes()
     if re.search(r"\b(system diagnostics?|pc health|check my pc|memory usage|how much ram|uptime|how long has my (?:pc|laptop|computer) been on)\b", t):
         return system_diagnostics()
     if re.search(r"\bsystem status\b", t):
