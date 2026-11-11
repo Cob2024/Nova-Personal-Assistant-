@@ -793,7 +793,7 @@ def play_spotify(query=""):
             return "Playing music on Spotify."
         return "I couldn't open Spotify."
     uri = "spotify:search:" + urllib.parse.quote(q)
-    ok = launch(str(exe), f"--uri={uri}") if exe else launch(uri)
+    ok = launch(uri) or (bool(exe) and launch(str(exe)))
     if ok:
         threading.Thread(target=lambda: (time.sleep(0.9), _focus_window("spotify")), daemon=True).start()
         return f"Opening {q} in Spotify."

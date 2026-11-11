@@ -835,7 +835,7 @@ class NovaTests(unittest.TestCase):
             self.assertEqual(assistant.handle("play a song on spotify"), "Playing music on Spotify.")
             self.assertEqual(assistant.handle("play blinding lights on spotify"), "Opening blinding lights in Spotify.")
         self.assertEqual(lfn.call_args_list[0].args, (r"C:\Apps\Spotify.exe",))
-        self.assertEqual(lfn.call_args_list[1].args, (r"C:\Apps\Spotify.exe", "--uri=spotify:search:blinding%20lights"))
+        self.assertEqual(lfn.call_args_list[1].args, ("spotify:search:blinding%20lights",))
 
         with mock.patch.object(nova_skills, "_spotify_exe", return_value=None), \
              mock.patch.object(nova_skills, "start_apps", return_value=[]), \
