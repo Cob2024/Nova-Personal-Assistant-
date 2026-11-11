@@ -28,6 +28,11 @@ try:
 except ImportError:
     mem_mod = None
 
+try:
+    import nova_calendar as cal_mod
+except ImportError:
+    cal_mod = None
+
 HOME = Path.home()
 DATA = HOME / ".laptop_assistant"
 DATA.mkdir(exist_ok=True)
@@ -746,6 +751,9 @@ def _scheduler():
                 ctx.get("alert", lambda k, t: print(t))(i["kind"], _alert_text(i, now))
             if ticks % 30 == 0:
                 _check_proactive_battery()
+            if ticks % 60 == 0 and cal_mod:
+                for msg in cal_mod.due_meeting_alerts(10):
+                    ctx.get("alert", lambda k, t: print(t))("calendar", msg)
         except Exception as err:
             print("scheduler error:", err)
 
@@ -1022,6 +1030,10 @@ def briefing():
     todays = [i for i in _load_rem() if i["kind"] != "timer" and i["due"] < end]
     if todays:
         out.append(f"{len(todays)} reminder{'s' * (len(todays) != 1)} or alarm{'s' * (len(todays) != 1)} today.")
+    if cal_mod:
+        cal_txt = cal_mod.events_summary("today")
+        if not cal_txt.startswith("You have no"):
+            out.append(cal_txt)
     info = _battery_info()
     if info and not info[1] and info[0] <= 30:
         out.append(f"Your battery is at {info[0]} percent and unplugged.")
@@ -1194,6 +1206,25 @@ def _exec_shell(cmd):
         return "That command timed out after 20 seconds."
     except Exception as err:
         return f"Command failed: {err}"
+
+
+def quick_lookup(topic):
+    """Fetch a concise 1-2 sentence factual summary from Wikipedia (no API key needed)."""
+    q = re.sub(r"^(?:who|what)\s+(?:is|was|are)\s+|^(?:define|tell me about)\s+", "", topic.strip(), flags=re.I)
+    q = q.strip(" ?.!")
+    if not q:
+        return None
+    slug = urllib.parse.quote(q.replace(" ", "_"))
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{slug}"
+    try:
+        data = _http_json(url, timeout=6)
+        extract = " ".join((data.get("extract") or "").split())
+        if not extract:
+            return None
+        sents = re.split(r"(?<=[.!?])\s+", extract)
+        return " ".join(sents[:2])[:360]
+    except Exception:
+        return None
 
 
 def read_webpage(url):
@@ -1444,6 +1475,10 @@ TOOLS = [
     _tool("delete_routine", "Delete a custom routine by name.", {"name": "string"}),
     _tool("git_status", "Check git branch and uncommitted changes in a repository.", {"repo?": "string"}),
     _tool("github_status", "Check GitHub PRs, issues, and notifications via gh CLI.", {}),
+    _tool("list_calendar", "Read upcoming calendar events for today, tomorrow, or week.", {"period?": "string"}),
+    _tool("add_calendar_event", "Add an event to the local calendar.",
+          {"title": "string", "start_iso": "string", "duration_mins?": "number"}),
+    _tool("quick_lookup", "Look up a concise factual summary for a topic or person.", {"topic": "string"}),
     _tool("take_screenshot", "Save a screenshot of the screen.", {}),
 ]
 FUNCS = {
@@ -1481,6 +1516,11 @@ FUNCS = {
     "delete_routine": delete_routine,
     "git_status": git_status,
     "github_status": github_status,
+    "list_calendar": lambda period="today": cal_mod.events_summary(period if period in ("today", "tomorrow", "week") else "today") if cal_mod else "Calendar module unavailable.",
+    "add_calendar_event": lambda title, start_iso, duration_mins=60: (
+        (cal_mod.add_event(title, datetime.fromisoformat(start_iso), duration_mins), f"Added {title} to your calendar.")[1]
+        if cal_mod else "Calendar module unavailable."),
+    "quick_lookup": lambda topic: quick_lookup(topic) or "I couldn't find a quick summary for that.",
     "take_screenshot": screenshot,
 }
 
@@ -2097,6 +2137,21 @@ def route(t, raw):
     if m := re.search(r"(?:^|\s)(?:run|execute)\s+(?:the\s+)?command\s+(.+)$", raw.strip(), re.I):
         cmd = m.group(1).strip()
         return confirm(f"Run command {cmd}?", lambda: _exec_shell(cmd))
+
+    # --- calendar & agenda ---
+    if cal_mod and re.search(r"\b(calendar|schedule|agenda|meetings?|events?|appointments?)\b", t) \
+            and re.search(r"\b(what|what's|any|list|show|check|my|today|tomorrow|week)\b", t):
+        period = "week" if "week" in t else "tomorrow" if "tomorrow" in t else "today"
+        return cal_mod.events_summary(period)
+    if cal_mod and re.match(r"(?:add|schedule|create|book)\s+(?:a\s+|an\s+)?(?:calendar\s+)?(?:event|meeting|appointment)\b", t):
+        c = parse_clock(re.sub(r"\bfor\b", "at", t, count=1))
+        if c:
+            dt, (a, b) = c
+            title = re.sub(r"^(?:add|schedule|create|book)\s+(?:a\s+|an\s+)?(?:calendar\s+)?(?:event|meeting|appointment)\s*(?:called|named|for)?\s*", "", (t[:a] + " " + t[b:]).strip())
+            title = re.sub(r"\b(?:tomorrow|today)\b", "", title).strip()
+            if title:
+                cal_mod.add_event(title, dt)
+                return f"Added {title} to your calendar {clock_text(dt)}."
 
     # --- memory, screen & active window ---
     if re.search(r"\b(what's|what is|read|look at|see|check|describe|explain)\b.*\b(on my screen|my screen|this screen)\b", t):

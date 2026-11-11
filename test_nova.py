@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import assistant
+import nova_calendar
 import nova_memory
 import nova_skills
 import nova_voice
@@ -19,6 +20,9 @@ class NovaTests(unittest.TestCase):
         self._orig_rem = nova_skills.REM_FILE
         self._orig_notes = nova_skills.NOTES
         self._orig_routines = nova_skills.ROUTINES_FILE
+        self._orig_events = nova_calendar.EVENTS_FILE
+        self._orig_cal_dir = nova_calendar.CAL_DIR
+        self._orig_cal_cfg = nova_calendar.CONFIG_FILE
         self._orig_tasks = assistant.TASKS_FILE
         self._orig_mem = nova_skills._mem
         self.tmp = tempfile.TemporaryDirectory()
@@ -27,6 +31,10 @@ class NovaTests(unittest.TestCase):
         nova_skills.REM_FILE = tmp_path / "reminders.json"
         nova_skills.NOTES = tmp_path / "Nova Notes.txt"
         nova_skills.ROUTINES_FILE = tmp_path / "routines.json"
+        nova_calendar.EVENTS_FILE = tmp_path / "events.json"
+        nova_calendar.CAL_DIR = tmp_path / "calendars"
+        nova_calendar.CONFIG_FILE = nova_skills.CONFIG_FILE
+        nova_calendar._alerted.clear()
         assistant.TASKS_FILE = tmp_path / "tasks.json"
         nova_skills._mem = nova_memory.Memory(tmp_path / "memory.db")
         nova_skills.reset_ai()
@@ -37,6 +45,10 @@ class NovaTests(unittest.TestCase):
         nova_skills.REM_FILE = self._orig_rem
         nova_skills.NOTES = self._orig_notes
         nova_skills.ROUTINES_FILE = self._orig_routines
+        nova_calendar.EVENTS_FILE = self._orig_events
+        nova_calendar.CAL_DIR = self._orig_cal_dir
+        nova_calendar.CONFIG_FILE = self._orig_cal_cfg
+        nova_calendar._alerted.clear()
         assistant.TASKS_FILE = self._orig_tasks
         nova_skills._mem = self._orig_mem
         nova_skills.reset_ai()
@@ -539,6 +551,38 @@ class NovaTests(unittest.TestCase):
         mic.stream = FakeStream([(np.full((16000, 1), 0.02, dtype=np.float32), False)])
         self.assertEqual(mic.recalibrate(), "Microphone recalibrated.")
         self.assertAlmostEqual(mic.ambient, 0.02, places=4)
+
+    def test_calendar_ics_events_alerts_and_quick_lookup(self):
+        from datetime import datetime, timedelta
+        ics = (
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:ev-1\r\n"
+            "SUMMARY:Project Sync\\, Team\r\n  Part 2\r\nLOCATION:Room B\r\n"
+            "DTSTART:20261201T143000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        evs = nova_calendar.parse_ics(ics)
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["title"], "Project Sync, Team Part 2")
+        self.assertEqual(evs[0]["location"], "Room B")
+
+        soon = datetime.now() + timedelta(minutes=5)
+        nova_calendar.add_event("Standup call", soon, duration_mins=30)
+        summary = assistant.handle("what's on my calendar today")
+        self.assertIn("standup call", summary.lower())
+        with mock.patch.object(nova_skills, "weather", return_value=""):
+            self.assertIn("standup call", nova_skills.briefing().lower())
+
+        alerts1 = nova_calendar.due_meeting_alerts(10)
+        alerts2 = nova_calendar.due_meeting_alerts(10)
+        self.assertEqual(len(alerts1), 1)
+        self.assertIn("standup call", alerts1[0].lower())
+        self.assertEqual(alerts2, [])
+
+        with mock.patch.dict("os.environ", {}, clear=True), \
+             mock.patch.object(nova_skills, "_http_json", return_value={
+                 "extract": "Ada Lovelace was an English mathematician. She worked on the Analytical Engine. Extra sentence."
+             }):
+            ans = assistant.handle("who is Ada Lovelace")
+        self.assertEqual(ans, "Ada Lovelace was an English mathematician. She worked on the Analytical Engine.")
 
 
 if __name__ == "__main__":

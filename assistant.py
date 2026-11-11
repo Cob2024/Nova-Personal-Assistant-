@@ -68,6 +68,11 @@ try:
 except ImportError:
     memory_mod = None
 
+try:
+    import nova_calendar as cal_mod   # ICS + local calendar events
+except ImportError:
+    cal_mod = None
+
 HOME = Path.home()
 DATA = HOME / ".laptop_assistant"
 TASKS_FILE = DATA / "tasks.json"
@@ -530,6 +535,10 @@ def handle(raw, on_sentence=None, stop_event=None):
 
     global _ai_hinted
     if skills and 2 <= len(t.split()) <= 200:
+        if (not skills.ai_ready()) and re.match(r"(?:who|what)\s+(?:is|was|are)\s+|(?:define|tell me about)\s+", t):
+            fact = skills.quick_lookup(t)
+            if fact:
+                return fact
         reply = skills.ask_ai(raw.strip(), on_sentence=on_sentence, stop_event=stop_event)
         if reply:
             return reply
@@ -1753,30 +1762,58 @@ def run_quick_ask_ui():
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.configure(bg="#14161f")
-    w, h = 520, 48
+    w = 540
     x = max(0, (root.winfo_screenwidth() - w) // 2)
-    root.geometry(f"{w}x{h}+{x}+24")
+    root.geometry(f"{w}x52+{x}+24")
 
     frame = tk.Frame(root, bg="#14161f", highlightbackground="#3b4363", highlightthickness=1)
     frame.pack(fill="both", expand=True)
     entry = tk.Entry(frame, bg="#14161f", fg="#ffffff", insertbackground="#ffffff",
                      relief="flat", font=("Segoe UI", 12))
-    entry.pack(fill="both", expand=True, padx=14, pady=10)
+    entry.pack(fill="x", padx=14, pady=10)
+    reply_lbl = tk.Label(frame, text="", bg="#14161f", fg="#d6dcff", justify="left",
+                         anchor="w", wraplength=w - 32, font=("Segoe UI", 10))
     entry.focus_force()
 
-    def submit(_event=None):
+    def _show_reply(txt):
+        reply_lbl.config(text=txt)
+        reply_lbl.pack(fill="x", padx=14, pady=(0, 12))
+        root.update_idletasks()
+        h = min(220, 62 + reply_lbl.winfo_reqheight() + 12)
+        root.geometry(f"{w}x{h}+{x}+24")
+
+    def submit(speak=False):
         text = entry.get().strip()
-        root.destroy()
         if not text:
             return
-        res = send_ipc({"op": "ask", "text": text, "speak": True})
-        if res is None:
-            setup_skills()
-            reply = handle(text)
-            if reply:
-                say(reply)
+        if speak:
+            root.destroy()
+            res = send_ipc({"op": "ask", "text": text, "speak": True})
+            if res is None:
+                setup_skills()
+                reply = handle(text)
+                if reply:
+                    say(reply)
+            return
+        entry.config(state="disabled")
+        _show_reply("Thinking…")
 
-    entry.bind("<Return>", submit)
+        def worker():
+            res = send_ipc({"op": "ask", "text": text, "speak": False})
+            if res is None:
+                setup_skills()
+                reply = handle(text) or "Done."
+            else:
+                reply = res.get("reply") or "Done."
+            try:
+                root.after(0, lambda: (entry.config(state="normal"), _show_reply(reply)))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    entry.bind("<Return>", lambda _e: submit(speak=False))
+    entry.bind("<Shift-Return>", lambda _e: submit(speak=True))
     entry.bind("<Escape>", lambda _e: root.destroy())
     root.mainloop()
 
@@ -1823,6 +1860,7 @@ def run_selftest():
     row("nova_skills.py next to assistant.py", skills is not None)
     row("nova_voice.py next to assistant.py", voice_mod is not None)
     row("nova_memory.py next to assistant.py", memory_mod is not None)
+    row("nova_calendar.py next to assistant.py", cal_mod is not None)
     for mod, why in (("faster_whisper", "hearing"), ("sounddevice", "microphone"), ("numpy", "audio and the Siri orb"),
                      ("edge_tts", "Jarvis British voice (Windows SAPI is the backup)"),
                      ("sherpa_onnx", "voice lock (only listen to you)"),

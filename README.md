@@ -11,11 +11,12 @@ Nova is a personal assistant being currently built to handle commands and tasks 
 - **Floating Dynamic Island Orb (`assistant.py`)**: Native Win32 layered window (`WinOverlay`) rendering a NumPy Siri-style liquid-glass orb reacting to audio levels, with Tkinter fallback (`TkOverlay`). Left-click stops speech / hides; right-click opens Quick Ask.
 - **Streaming Multi-Provider AI Brain (`nova_skills.py`)**: Supports **Ollama Cloud** (`https://ollama.com/v1`, `deepseek-v4.1-flash`), **Anthropic Claude**, **OpenAI / OpenAI-compatible**, **Google Gemini**, and **local offline Ollama** — streaming replies sentence-by-sentence directly into speech with multi-step tool calling.
 - **Persistent Personal Memory (`nova_memory.py`)**: SQLite-backed facts and cross-session conversation history (`~/.laptop_assistant/memory.db`) with voice/AI `remember`, `recall`, and `forget`.
-- **Active-Window & Screen Awareness**: Reads active foreground window title/app (`ctypes`), captures screenshots for multimodal AI inspection (`"what's on my screen?"`), and summarizes web links (`read_webpage`).
+- **Active-Window & Screen Awareness**: Reads active foreground window title/app (`ctypes`), captures screenshots for multimodal AI inspection (`"what's on my screen?"`), reads web links (`read_webpage`), and handles quick factual lookups (`quick_lookup` via Wikipedia).
+- **Calendar & Proactive Meeting Alerts (`nova_calendar.py`)**: Parses `.ics` feeds (`CALENDAR_ICS_URL` in `.env` or `~/.laptop_assistant/calendars/*.ics`) plus voice-created events (`"add calendar event ..."`), feeds them into your daily briefing, and alerts 10 minutes before meetings.
 - **Windows Control, Routines & Dev Tools**: Native Windows Core Audio volume/mute (`IAudioEndpointVolume`), live RAM/uptime/battery/disk diagnostics, top memory process inspection, dynamic app launching/closing, undoable file sorting & trash, recurring reminders/timers/alarms, proactive low-battery alerts, custom multi-step routines (`"focus mode"`, `"break time"`, `"create routine ..."`), read-only Git/GitHub status checks, and confirmation-gated shell commands (`"run command ..."`).
 - **Global Hotkeys & Local IPC**:
   - `Ctrl+Shift+Space`: Wake Nova directly (no wake word needed) or interrupt Nova mid-speech.
-  - `Ctrl+Shift+J`: Open the floating Quick-Ask bar for silent typed commands.
+  - `Ctrl+Shift+J`: Open the floating Quick-Ask bar (`Enter` replies silently inline; `Shift+Enter` speaks aloud).
 
 ---
 
