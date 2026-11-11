@@ -731,10 +731,36 @@ def empty_recycle_bin():
     return "Done. The Recycle Bin is empty."
 
 
+def _explorer_safe_target(target):
+    """True only when target is a verified local path, executable on PATH, or registered Windows URI scheme."""
+    t = str(target or "").strip()
+    if not t:
+        return False
+    if Path(t).exists() or shutil.which(t):
+        return True
+    if t.startswith("shell:"):
+        return True
+    m = re.match(r"^([a-zA-Z][a-zA-Z0-9+.\-]{1,30}):", t)
+    if m:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, m.group(1)):
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def launch(target, arg=""):
-    """Launch an app, URI, shortcut, or file visibly with COM STA + SW_SHOWNORMAL and zero modal UI popups."""
+    """Launch an app, URI, shortcut, or file visibly (delegating clean targets via explorer.exe)."""
     if not IS_WIN:
         return False
+    if not arg and _explorer_safe_target(target):
+        try:
+            subprocess.Popen(["explorer.exe", str(target)], creationflags=NOWIN)
+            return True
+        except OSError:
+            pass
     ole32 = ctypes.windll.ole32
     hr = -1
     try:
