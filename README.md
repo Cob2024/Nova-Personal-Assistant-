@@ -20,7 +20,22 @@ Nova is a personal assistant being currently built to handle commands and tasks 
 
 ---
 
-## Setup (Python 3.12 on Windows)
+## Download & Install as a Windows App
+
+Anyone can install Nova as a desktop application on another Windows 10/11 laptop (with Start Menu shortcuts, Desktop shortcut, Windows Apps & Features uninstaller, optional auto-start, and a first-run Customize wizard to set their own name and wake word):
+
+1. **From GitHub Releases / Installer EXE**: Download `NovaAssistant-Setup.exe` (or `NovaAssistant-Standalone-Windows.zip`) from the repository **Releases** page and run it.
+2. **From Repository ZIP**: Download the repo ZIP, extract it, and double-click **`Install_Nova.bat`**.
+3. **Build installers locally** into `dist/`:
+   ```powershell
+   py -3.12 build_app.py                # Builds dist/NovaAssistant-Portable-Windows.zip + dist/NovaAssistant-Setup.exe
+   py -3.12 build_app.py --pyinstaller  # Also builds standalone zero-Python bundle (requires PyInstaller)
+   ```
+4. **Uninstall anytime**: Run **Uninstall Nova Assistant** from Windows Start Menu / Settings -> Apps, or `py -3.12 install_nova.py --uninstall`.
+
+---
+
+## Setup (Developer / Source Mode, Python 3.12 on Windows)
 
 ```powershell
 # Core voice, transcription & smooth orb UI
@@ -46,13 +61,15 @@ See [COMMANDS.md](COMMANDS.md) for the complete reference of every offline lapto
 
 ```powershell
 py -3.12 assistant.py                 # Voice mode + Dynamic Island orb
+py -3.12 assistant.py --customize     # Customize assistant name, user profile, voice & AI
 py -3.12 assistant.py --text          # Text chat mode in terminal
 py -3.12 assistant.py --ask "battery" # Send one command to running Nova (or standalone)
 py -3.12 assistant.py --enroll        # Record 6-line voiceprint (requires sherpa-onnx)
 py -3.12 assistant.py --selftest      # Check dependencies and Windows features
 py -3.12 assistant.py --mictest       # Test microphone levels
 py -3.12 assistant.py --voicetest     # Test speech output
-py -3.12 install_nova.py              # Auto-start Nova silently on Windows login
+py -3.12 install_nova.py              # Install Desktop/Start Menu/Startup app shortcuts
+py -3.12 install_nova.py --uninstall  # Uninstall shortcuts, startup & registry entry
 ```
 
 ---

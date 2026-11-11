@@ -11,6 +11,11 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+dist/
+build/
+*.spec
+*.exe
+*.zip
 
 # Local runtime state, databases, logs, and credentials
 *.db

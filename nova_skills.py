@@ -18,6 +18,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -43,7 +44,8 @@ DATA.mkdir(exist_ok=True)
 UNDO_FILE, REM_FILE, CONFIG_FILE = DATA / "last_move.json", DATA / "reminders.json", DATA / "config.json"
 ROUTINES_FILE = DATA / "routines.json"
 NOTES = HOME / "Documents" / "Nova Notes.txt"
-ENV_FILE = Path(__file__).resolve().parent / ".env"
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+ENV_FILE = APP_DIR / ".env"
 IS_WIN = os.name == "nt"
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WIN_ONLY = "Sorry, I can only do that on Windows."
@@ -1279,7 +1281,7 @@ def run_routine(name):
 def _find_repo(repo_hint=""):
     hint = repo_hint.strip().strip("\"'")
     if not hint:
-        return Path(__file__).resolve().parent
+        return APP_DIR
     p = Path(hint)
     if p.exists():
         return p
@@ -1415,6 +1417,22 @@ def _memory():
     return _mem
 
 
+DEFAULT_ASSISTANT_NAME = "Nova"
+DEFAULT_WAKE_ALIASES = {"nova", "novah", "novo", "nover", "no va", "nowa"}
+VOICE_PRESETS = (
+    "en-GB-RyanNeural",
+    "en-GB-SoniaNeural",
+    "en-US-GuyNeural",
+    "en-US-AriaNeural",
+    "en-AU-WilliamNeural",
+)
+
+
+def _save_config(cfg):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
 def _format_person_name(name):
     cleaned = re.sub(r"[?.!,]+$", "", " ".join(str(name).split())).strip()
     cleaned = re.sub(r"(?:\s+(?:please|thanks|thank you))+$", "", cleaned, flags=re.I).strip()
@@ -1424,30 +1442,171 @@ def _format_person_name(name):
                     for w in cleaned.split())
 
 
+def get_assistant_name():
+    """Return the configured assistant wake/display name (defaults to 'Nova')."""
+    return str(_config().get("assistant_name") or "").strip() or DEFAULT_ASSISTANT_NAME
+
+
+def set_assistant_name(name):
+    """Rename the assistant persistently in config.json."""
+    clean_name = _format_person_name(name)
+    if len(re.sub(r"[^a-zA-Z0-9]", "", clean_name)) < 2:
+        return "Pick a name with at least two letters."
+    cfg = _config()
+    cfg["assistant_name"] = clean_name
+    _save_config(cfg)
+    if "reload" in ctx:
+        ctx["reload"]()
+    return f"Okay, my name is now {clean_name}. Just say {clean_name} when you want my attention."
+
+
+def get_wake_aliases():
+    """Return lowercase wake phrases for the configured assistant name."""
+    cfg = _config()
+    aname = get_assistant_name().lower()
+    aliases = {aname}
+    if aname == "nova":
+        aliases |= DEFAULT_WAKE_ALIASES
+    extra = cfg.get("wake_aliases") or []
+    if isinstance(extra, str):
+        extra = [x.strip() for x in extra.split(",") if x.strip()]
+    aliases |= {str(x).strip().lower() for x in extra if str(x).strip()}
+    return aliases
+
+
+def get_saved_users():
+    """Return known user profile names from config + active user."""
+    cfg = _config()
+    raw = cfg.get("saved_users") or []
+    users = []
+    for item in (raw if isinstance(raw, list) else []):
+        val = _format_person_name(item)
+        if val and val not in users:
+            users.append(val)
+    cur = get_user_name()
+    if cur and cur not in users:
+        users.append(cur)
+    return users
+
+
 def get_user_name():
-    """Return the user's saved name from persistent memory (or config), if known."""
+    """Return the user's saved name from config or persistent memory, if known."""
+    cfg_name = str(_config().get("user_name") or "").strip()
+    if cfg_name:
+        return cfg_name
     m = _memory()
     if m:
         for key in ("user_name", "name", "first_name"):
             row = next((f for f in m.all_facts(limit=30) if f["key"] == key and f["value"].strip()), None)
             if row:
                 return row["value"].strip()
-    return str(_config().get("user_name") or "").strip()
+    return ""
 
 
 def set_user_name(name):
-    """Save the user's preferred name into persistent memory (or config fallback)."""
+    """Save and switch the active user profile name cleanly across memory and config."""
     clean_name = _format_person_name(name)
     if not clean_name:
         return "What name should I call you?"
+    cfg = _config()
+    users = [u for u in get_saved_users() if u.lower() != clean_name.lower()]
+    users.insert(0, clean_name)
+    cfg["user_name"] = clean_name
+    cfg["saved_users"] = users[:12]
+    _save_config(cfg)
     m = _memory()
     if m:
         m.remember("user_name", clean_name, category="profile")
-    else:
-        cfg = _config()
-        cfg["user_name"] = clean_name
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return f"Got it, {clean_name}. I'll remember your name."
+
+
+def list_users_text():
+    users = get_saved_users()
+    cur = get_user_name()
+    if not users:
+        return "No user profiles saved yet. Say my name is followed by your name."
+    names = ", ".join(users)
+    return f"Saved user profiles: {names}. Currently active: {cur or users[0]}."
+
+
+def get_voice_prefs():
+    cfg = _config()
+    return {
+        "engine": str(cfg.get("voice_engine") or "auto").strip().lower() or "auto",
+        "name": str(cfg.get("voice_name") or "en-GB-RyanNeural").strip() or "en-GB-RyanNeural",
+    }
+
+
+def get_profile():
+    cfg = _config()
+    vp = get_voice_prefs()
+    extra = cfg.get("wake_aliases") or []
+    aliases_str = ", ".join(extra) if isinstance(extra, list) else str(extra or "")
+    return {
+        "assistant_name": get_assistant_name(),
+        "user_name": get_user_name(),
+        "saved_users": get_saved_users(),
+        "wake_aliases": aliases_str,
+        "voice_engine": vp["engine"],
+        "voice_name": vp["name"],
+    }
+
+
+def update_profile(assistant_name=None, user_name=None, wake_aliases=None, voice_engine=None, voice_name=None):
+    """Apply customization changes atomically from the GUI or setup wizard."""
+    cfg = _config()
+    if assistant_name is not None:
+        aname = _format_person_name(assistant_name)
+        if len(re.sub(r"[^a-zA-Z0-9]", "", aname)) >= 2:
+            cfg["assistant_name"] = aname
+    if wake_aliases is not None:
+        items = [w.strip().lower() for w in re.split(r"[,;\n]+", str(wake_aliases)) if w.strip()]
+        cfg["wake_aliases"] = items
+    if voice_engine in ("auto", "neural", "sapi", "basic"):
+        cfg["voice_engine"] = voice_engine
+    if voice_name is not None and str(voice_name).strip():
+        cfg["voice_name"] = str(voice_name).strip()
+    if user_name is not None:
+        uname = _format_person_name(user_name)
+        cfg["user_name"] = uname
+        if uname:
+            users = [u for u in (cfg.get("saved_users") or []) if _format_person_name(u).lower() != uname.lower()]
+            cfg["saved_users"] = ([uname] + users)[:12]
+        _save_config(cfg)
+        m = _memory()
+        if m:
+            if uname:
+                m.remember("user_name", uname, category="profile")
+            else:
+                m.forget("user_name")
+    else:
+        _save_config(cfg)
+    if "reload" in ctx:
+        ctx["reload"]()
+    return get_profile()
+
+
+def reset_personal_data():
+    """Reset assistant name, user profile, and saved memory/voiceprint (for sharing/reinstalling)."""
+    cfg = _config()
+    for k in ("assistant_name", "user_name", "saved_users", "wake_aliases", "voice_engine", "voice_name"):
+        cfg.pop(k, None)
+    _save_config(cfg)
+    m = _memory()
+    if m and hasattr(m, "clear_all"):
+        m.clear_all()
+    elif m:
+        for f in m.all_facts(limit=500):
+            m.forget(f["key"])
+    vp = DATA / "voiceprint.json"
+    if vp.exists():
+        try:
+            vp.unlink()
+        except OSError:
+            pass
+    if "reload" in ctx:
+        ctx["reload"]()
+    return "Profile reset to defaults."
 
 
 def active_window():
@@ -1710,7 +1869,7 @@ FUNCS = {
 
 
 def _system():
-    base = ("You are Nova, a sharp, Jarvis-like personal AI assistant living on the user's Windows laptop. "
+    base = (f"You are {get_assistant_name()}, a sharp, Jarvis-like personal AI assistant living on the user's Windows laptop. "
             "Your replies are spoken aloud: answer in one to three short sentences, in plain words, "
             "with no markdown, lists, links or emojis. Use the tools to act on the laptop when asked, "
             "remember personal facts/preferences the user shares via remember_fact, and confirm briefly what you did. "
@@ -2496,7 +2655,21 @@ def route(t, raw):
                 cal_mod.add_event(title, dt)
                 return f"Added {title} to your calendar {clock_text(dt)}."
 
-    # --- user identity, memory, screen & active window ---
+    # --- user identity, assistant customization, memory, screen & active window ---
+    if re.search(r"\b(?:open |launch |show )?(?:customi[sz]e|customi[sz]ation|personalize)\b(?: assistant| settings| profile)?$", t):
+        if "open_customize" in ctx:
+            ctx["open_customize"]()
+            return "Opening customization settings."
+        return "Run with --customize to open customization settings."
+    if m := (re.match(r"(?:change|set) your name to ([a-z][a-z0-9'\- ]{1,25})$", t)
+             or re.match(r"rename yourself (?:to )?([a-z][a-z0-9'\- ]{1,25})$", t)
+             or re.match(r"(?:call yourself|i(?:'ll| will) call you) ([a-z][a-z0-9'\- ]{1,25})$", t)
+             or re.match(r"your name is now ([a-z][a-z0-9'\- ]{1,25})$", t)):
+        return set_assistant_name(m.group(1))
+    if re.search(r"\b(?:list|show|who are)\b.*\busers\b|\bcurrent user\b|\bsaved users\b", t):
+        return list_users_text()
+    if m := re.match(r"(?:switch|change|set)(?: the)? user (?:profile )?to ([a-z][a-z'\- ]{1,30})$", t):
+        return set_user_name(m.group(1))
     if re.search(r"\b(?:what(?:'s| is) my name|who am i|do you know my name)\b", t):
         uname = get_user_name()
         return f"Your name is {uname}." if uname else "You haven't told me your name yet. Just say my name is, followed by your name."
@@ -2532,7 +2705,8 @@ def route(t, raw):
         return open_thing(m.group(1))
 
     # --- briefing, dictation, typing, notes, clipboard ---
-    if re.fullmatch(r"good (morning|afternoon|evening)( nova)?", t) or \
+    aname_l = get_assistant_name().lower()
+    if re.fullmatch(rf"good (morning|afternoon|evening)(?: (?:nova|{re.escape(aname_l)}))?", t) or \
             re.search(r"\b(daily|morning) briefing\b|\bbrief me\b|\bwhat's my day\b", t):
         return briefing()
     if re.match(r"(start dictat|dictate|dictation mode)", t):

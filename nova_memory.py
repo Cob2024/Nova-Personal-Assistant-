@@ -135,6 +135,11 @@ class Memory:
             conn.executemany("DELETE FROM facts WHERE key = ?", [(k,) for k in matches])
             return len(matches)
 
+    def clear_all(self):
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM facts")
+            conn.execute("DELETE FROM episodes")
+
     def add_episode(self, user_text, assistant_text, keep=400):
         u = " ".join(str(user_text).strip().split())[:400]
         a = " ".join(str(assistant_text).strip().split())[:400]

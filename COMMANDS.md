@@ -22,6 +22,7 @@ Optional **Internet** commands fetch live data (weather, Wikipedia summaries, we
 > **CLI shortcuts** (run from terminal):
 > - `py -3.12 assistant.py --ask "battery"` — send any single command to running Nova (or run standalone)
 > - `py -3.12 assistant.py --quick-ask-ui` — open the quick-ask bar manually
+> - `py -3.12 assistant.py --customize` — rename assistant, switch user, pick voice, configure AI, install Windows shortcuts
 > - `py -3.12 assistant.py --selftest` — verify packages, audio, Start Menu apps, and AI status
 > - `py -3.12 assistant.py --mictest` / `--voicetest` — test microphone input levels or TTS output
 > - `py -3.12 assistant.py --enroll` — enroll your voiceprint so Nova ignores other speakers (requires `sherpa-onnx`)
@@ -189,11 +190,14 @@ Optional **Internet** commands fetch live data (weather, Wikipedia summaries, we
 
 ---
 
-## 10. Identity, Memory, Web & Optional AI Features
+## 10. Identity, Customization, Multi-User, Memory & Web
 
-- **Your Name & Identity** (stored locally in `~/.laptop_assistant/memory.db`, works offline):
+- **Rename Assistant & Switch Users** (works 100% offline & persists in `~/.laptop_assistant/`):
+  - `"Change your name to Jarvis"` / `"Rename yourself to Atlas"` / `"Call yourself Friday"` *(updates wake word, greetings, and AI identity immediately)*
   - `"My name is Cobby"` / `"Call me Cobby"` / `"Remember that my name is Cobby"`
-  - `"What's my name?"` / `"Who am I?"` / `"Do you know my name?"` *(Nova also greets you by name on startup, wake, `"hello"`, `"good morning"`, and `"daily briefing"`)*
+  - `"Switch user to Alex"` / `"Change user to Sarah"` / `"List users"` / `"Who is the current user?"`
+  - `"What's my name?"` / `"Who am I?"` / `"Do you know my name?"`
+  - `"Open customize"` / `"Customize assistant"` *(or click **Customize** in Quick Ask / run `py -3.12 assistant.py --customize`)* — opens GUI to edit assistant name, wake aliases, active user, voice preset, optional AI API key, or reset profile for a new user.
 - **Persistent local memory** (`~/.laptop_assistant/memory.db`, works offline):
   - `"Remember that my favorite coffee is espresso"` / `"Remember my Wi-Fi password is ..."`
   - `"What do you remember about coffee?"`

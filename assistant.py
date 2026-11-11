@@ -12,6 +12,7 @@ Run:    python assistant.py              (voice)
         python assistant.py --enroll     (only listen to your voice; needs sherpa-onnx)
         python assistant.py --background (hidden mode used at startup, logs to nova.log)
         python assistant.py --no-overlay (voice without the popup window)
+        python assistant.py --customize  (rename assistant, switch user, pick voice, setup AI & shortcuts)
         python assistant.py --setup-ai   (connect Claude, Ollama Cloud, OpenAI, Gemini, or local Ollama)
         python assistant.py --selftest   (check packages and Windows features)
 """
@@ -121,11 +122,42 @@ _stop_speech_event = threading.Event()
 _voice = None
 
 
+def _assistant_name():
+    return skills.get_assistant_name() if skills and hasattr(skills, "get_assistant_name") else NAME
+
+
+def _wake_words():
+    return skills.get_wake_aliases() if skills and hasattr(skills, "get_wake_aliases") else WAKE_ALIASES
+
+
+def _self_cmd(*args, windowless=True):
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *args]
+    py = Path(sys.executable)
+    exe = py.with_name("pythonw.exe") if windowless else py
+    exe = exe if exe.exists() else py
+    return [str(exe), str(Path(__file__).resolve()), *args]
+
+
 def _get_voice():
     global _voice
-    if _voice is None and voice_mod and VOICE_ENGINE != "basic":
-        _voice = voice_mod.Voice(engine=VOICE_ENGINE, name=VOICE_NAME)
+    vp = skills.get_voice_prefs() if skills and hasattr(skills, "get_voice_prefs") \
+        else {"engine": VOICE_ENGINE, "name": VOICE_NAME}
+    eng, vname = vp["engine"], vp["name"]
+    if eng == "basic":
+        return None
+    if _voice is None and voice_mod:
+        _voice = voice_mod.Voice(engine=eng, name=vname)
     return _voice
+
+
+def reload_voice():
+    """Drop the cached voice engine so the next reply picks up updated profile/voice settings."""
+    global _voice
+    with _speech_lock:
+        old, _voice = _voice, None
+        if old is not None:
+            old.close()
 
 
 def stop_speaking():
@@ -491,8 +523,10 @@ def handle(raw, on_sentence=None, stop_event=None):
         return None
     if skills and skills.dictating():
         return skills.dictate(raw, t)
-    if re.fullmatch(r"(?:please )?(?:quit|exit)(?: nova)?(?: please)?", t) or \
-            re.search(r"\b(shut ?down|turn off|power off|quit|exit) nova\b", t):
+    aname = _assistant_name()
+    aname_re = re.escape(aname.lower())
+    if re.fullmatch(rf"(?:please )?(?:quit|exit)(?: (?:nova|{aname_re}))?(?: please)?", t) or \
+            re.search(rf"\b(shut ?down|turn off|power off|quit|exit) (?:nova|{aname_re})\b", t):
         raise SystemExit("Okay, shutting down. Goodbye!")
     if awaiting:
         step, awaiting = awaiting, None
@@ -515,7 +549,7 @@ def handle(raw, on_sentence=None, stop_event=None):
 
     # small talk and info
     if re.search(r"\b(your name|who are you)\b", t):
-        return "I'm Nova, your assistant. I live on your laptop and help with your files and tasks."
+        return f"I'm {_assistant_name()}, your assistant. I live on your laptop and help with your files and tasks."
     if len(t.split()) <= 3 and re.match(r"(hello|hi|hey|good (morning|afternoon|evening))\b", t):
         uname = _user_name()
         if uname:
@@ -591,13 +625,15 @@ def handle(raw, on_sentence=None, stop_event=None):
 
 
 def find_wake(heard):
-    """Text after the name ('' if nothing follows), or None if Nova wasn't called.
-    The name must be within the first 5 words, so it ignores 'nova' mid-sentence."""
+    """Text after the configured assistant name ('' if nothing follows), or None if not called.
+    The name must be within the first 5 words, so it ignores mid-sentence mentions."""
+    target = _assistant_name().lower()
+    aliases = _wake_words()
     words = heard.split()
     for i, w in enumerate(words[:5]):
-        if " ".join(words[i:i + 2]) in WAKE_ALIASES:
+        if " ".join(words[i:i + 2]) in aliases:
             return " ".join(words[i + 2:])
-        if w in WAKE_ALIASES or SequenceMatcher(None, w, "nova").ratio() >= 0.8:
+        if w in aliases or SequenceMatcher(None, w, target).ratio() >= 0.8:
             return " ".join(words[i + 1:])
     return None
 
@@ -624,6 +660,8 @@ def setup_skills():
     skills.configure(ask=ask, is_yes=is_yes, alert=alert, load_tasks=load_tasks,
                      add_task=add_task, list_tasks=list_tasks, change_task=change_task,
                      handle=handle,
+                     reload=reload_voice,
+                     open_customize=lambda: threading.Thread(target=_launch_customize, daemon=True).start(),
                      recalibrate=lambda: _mic.recalibrate() if _mic else "Microphone calibration is only available in voice mode.")
     skills.start_scheduler()
 
@@ -1513,10 +1551,12 @@ def _parse_hotkey(spec):
 
 
 def _launch_quick_ask():
-    py = Path(sys.executable)
-    exe = py.with_name("pythonw.exe")
-    exe = exe if exe.exists() else py
-    subprocess.Popen([str(exe), str(Path(__file__).resolve()), "--quick-ask-ui"],
+    subprocess.Popen(_self_cmd("--quick-ask-ui"),
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _launch_customize():
+    subprocess.Popen(_self_cmd("--customize"),
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
@@ -1582,12 +1622,12 @@ def run_voice():
                 print(f"   (voice lock disabled: {vl.error})")
     global _mic
     mic = _mic = Mic(voice_lock=voice_lock)
-    uname = _user_name()
+    aname, uname = _assistant_name(), _user_name()
     if background:
-        say(f"Nova is online. Hello {uname}." if uname else "Nova is online.")
+        say(f"{aname} is online. Hello {uname}." if uname else f"{aname} is online.")
     else:
-        say(f"I'm ready, {uname}. Just say {NAME} when you need me." if uname
-            else f"I'm ready. Just say {NAME} when you need me.")
+        say(f"I'm ready, {uname}. Just say {aname} when you need me." if uname
+            else f"I'm ready. Just say {aname} when you need me.")
     if not skills:
         say("My abilities file is missing, so I can only do the basics. Put nova skills dot pie next to my main file.")
     UI.post("hide")
@@ -1701,6 +1741,9 @@ def _ipc_handle(req):
     if op == "wake":
         _wake_event.set()
         return {"ok": True}
+    if op == "reload":
+        reload_voice()
+        return {"ok": True}
     if op == "ask":
         text = (req.get("text") or "").strip()
         if not text:
@@ -1802,7 +1845,7 @@ def run_ask(query):
 def run_quick_ask_ui():
     import tkinter as tk
     root = tk.Tk()
-    root.title("Nova Quick Ask")
+    root.title(f"{_assistant_name()} Quick Ask")
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.configure(bg="#14161f")
@@ -1812,9 +1855,14 @@ def run_quick_ask_ui():
 
     frame = tk.Frame(root, bg="#14161f", highlightbackground="#3b4363", highlightthickness=1)
     frame.pack(fill="both", expand=True)
-    entry = tk.Entry(frame, bg="#14161f", fg="#ffffff", insertbackground="#ffffff",
+    row = tk.Frame(frame, bg="#14161f")
+    row.pack(fill="x", padx=14, pady=10)
+    entry = tk.Entry(row, bg="#14161f", fg="#ffffff", insertbackground="#ffffff",
                      relief="flat", font=("Segoe UI", 12))
-    entry.pack(fill="x", padx=14, pady=10)
+    entry.pack(side="left", fill="x", expand=True)
+    tk.Button(row, text="Customize", bg="#22273a", fg="#aab8ff", activebackground="#2e3550",
+              activeforeground="#ffffff", relief="flat", font=("Segoe UI", 9), padx=8, pady=2,
+              command=lambda: (root.destroy(), _launch_customize())).pack(side="right", padx=(8, 0))
     reply_lbl = tk.Label(frame, text="", bg="#14161f", fg="#d6dcff", justify="left",
                          anchor="w", wraplength=w - 32, font=("Segoe UI", 10))
     entry.focus_force()
@@ -1862,6 +1910,143 @@ def run_quick_ask_ui():
     root.mainloop()
 
 
+def run_customize_ui():
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+    if not skills:
+        return
+    prof = skills.get_profile()
+    cfg = skills._config()
+    ready_ai, cur_prov, cur_model = skills.ai_status()
+
+    root = tk.Tk()
+    root.title(f"Customize {prof['assistant_name']}")
+    root.configure(bg="#14161f")
+    root.resizable(False, False)
+    w, h = 500, 470
+    x = max(0, (root.winfo_screenwidth() - w) // 2)
+    y = max(0, (root.winfo_screenheight() - h) // 2 - 20)
+    root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def lbl(parent, text):
+        return tk.Label(parent, text=text, bg="#14161f", fg="#cbd5f5", font=("Segoe UI", 9, "bold"), anchor="w")
+
+    def ent(parent, var, show=""):
+        return tk.Entry(parent, textvariable=var, show=show, bg="#1e2233", fg="#ffffff",
+                        insertbackground="#ffffff", relief="flat", font=("Segoe UI", 10))
+
+    body = tk.Frame(root, bg="#14161f", padx=20, pady=16)
+    body.pack(fill="both", expand=True)
+    tk.Label(body, text="Personalize Assistant & User Profile", bg="#14161f", fg="#ffffff",
+             font=("Segoe UI", 13, "bold"), anchor="w").pack(fill="x", pady=(0, 12))
+
+    v_aname = tk.StringVar(value=prof["assistant_name"])
+    v_aliases = tk.StringVar(value=prof["wake_aliases"])
+    v_uname = tk.StringVar(value=prof["user_name"])
+    v_veng = tk.StringVar(value=prof["voice_engine"])
+    v_vname = tk.StringVar(value=prof["voice_name"])
+    v_prov = tk.StringVar(value=cfg.get("provider") or (cur_prov if ready_ai else "none"))
+    v_model = tk.StringVar(value=cfg.get("model") or cur_model or "")
+    v_key = tk.StringVar(value="")
+
+    for caption, widget_fn in (
+        ("Assistant Name (wake word)", lambda p: ent(p, v_aname)),
+        ("Extra Wake Aliases (comma-separated, optional)", lambda p: ent(p, v_aliases)),
+        ("Active User Name (pick or type new)", lambda p: ttk.Combobox(p, textvariable=v_uname, values=prof["saved_users"])),
+    ):
+        lbl(body, caption).pack(fill="x")
+        widget_fn(body).pack(fill="x", pady=(2, 8), ipady=4)
+
+    vrow = tk.Frame(body, bg="#14161f")
+    vrow.pack(fill="x", pady=(0, 8))
+    left_v = tk.Frame(vrow, bg="#14161f")
+    left_v.pack(side="left", fill="x", expand=True, padx=(0, 6))
+    lbl(left_v, "Voice Engine").pack(fill="x")
+    ttk.Combobox(left_v, textvariable=v_veng, values=("auto", "neural", "sapi", "basic"), state="readonly").pack(fill="x", pady=2)
+    right_v = tk.Frame(vrow, bg="#14161f")
+    right_v.pack(side="left", fill="x", expand=True, padx=(6, 0))
+    lbl(right_v, "Neural Voice").pack(fill="x")
+    ttk.Combobox(right_v, textvariable=v_vname, values=skills.VOICE_PRESETS).pack(fill="x", pady=2)
+
+    arow = tk.Frame(body, bg="#14161f")
+    arow.pack(fill="x", pady=(0, 8))
+    p_col = tk.Frame(arow, bg="#14161f")
+    p_col.pack(side="left", fill="x", expand=True, padx=(0, 6))
+    lbl(p_col, "AI Provider (optional)").pack(fill="x")
+    ttk.Combobox(p_col, textvariable=v_prov,
+                 values=("none", "ollama_cloud", "anthropic", "openai", "gemini", "ollama"),
+                 state="readonly").pack(fill="x", pady=2)
+    m_col = tk.Frame(arow, bg="#14161f")
+    m_col.pack(side="left", fill="x", expand=True, padx=(6, 0))
+    lbl(m_col, "Model (optional)").pack(fill="x")
+    ent(m_col, v_model).pack(fill="x", pady=2, ipady=3)
+
+    lbl(body, "API Key (leave blank to keep existing key)").pack(fill="x")
+    ent(body, v_key, show="*").pack(fill="x", pady=(2, 10), ipady=4)
+
+    startup_vbs = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Nova.vbs"
+    v_auto = tk.BooleanVar(value=startup_vbs.exists())
+    if os.name == "nt":
+        tk.Checkbutton(body, text="Start automatically when Windows logs in", variable=v_auto,
+                       bg="#14161f", fg="#cbd5f5", selectcolor="#1e2233", activebackground="#14161f",
+                       activeforeground="#ffffff", font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 10))
+
+    def on_save():
+        skills.update_profile(
+            assistant_name=v_aname.get(), user_name=v_uname.get(), wake_aliases=v_aliases.get(),
+            voice_engine=v_veng.get(), voice_name=v_vname.get(),
+        )
+        new_cfg = skills._config()
+        prov = v_prov.get().strip()
+        if prov and prov != "none":
+            new_cfg["provider"] = prov
+            if v_model.get().strip():
+                new_cfg["model"] = v_model.get().strip()
+            if v_key.get().strip():
+                new_cfg["api_key"] = v_key.get().strip()
+            skills.reset_ai_cooldown()
+        elif prov == "none":
+            new_cfg.pop("provider", None)
+            new_cfg.pop("api_key", None)
+        skills._save_config(new_cfg)
+        if os.name == "nt":
+            try:
+                import install_nova
+                install_nova.set_autostart(v_auto.get(), target_dir=skills.APP_DIR)
+            except Exception:
+                pass
+        send_ipc({"op": "reload"})
+        root.destroy()
+
+    def on_install_app():
+        try:
+            import install_nova
+            dest = install_nova.install_app(autostart=v_auto.get(), launch_now=False, open_customize=False)
+            messagebox.showinfo("Installed", f"App shortcuts installed cleanly!\nLocation: {dest}")
+        except Exception as err:
+            messagebox.showerror("Install Error", str(err))
+
+    def on_reset():
+        if messagebox.askyesno("Reset Profile", "Clear saved user name, memories, tasks, and voiceprint for a fresh user?"):
+            skills.reset_personal_data()
+            TASKS_FILE.unlink(missing_ok=True)
+            v_aname.set("Nova"); v_uname.set(""); v_aliases.set("")
+            v_veng.set("auto"); v_vname.set("en-GB-RyanNeural")
+            send_ipc({"op": "reload"})
+
+    btns = tk.Frame(body, bg="#14161f")
+    btns.pack(fill="x", pady=(6, 0))
+    tk.Button(btns, text="Reset Profile", bg="#3a2028", fg="#ffb4c2", relief="flat", padx=10, pady=6,
+              command=on_reset).pack(side="left")
+    if os.name == "nt":
+        tk.Button(btns, text="Install App Shortcuts", bg="#22273a", fg="#cbd5f5", relief="flat", padx=10, pady=6,
+                  command=on_install_app).pack(side="left", padx=8)
+    tk.Button(btns, text="Save & Apply", bg="#3b82f6", fg="#ffffff", relief="flat", padx=16, pady=6,
+              font=("Segoe UI", 9, "bold"), command=on_save).pack(side="right")
+
+    root.mainloop()
+
+
 def start_voice():
     global UI
     if "--no-overlay" not in sys.argv:
@@ -1899,7 +2084,7 @@ def run_selftest():
             return True
         except Exception:
             return False
-    print("Nova self-test")
+    print(f"{_assistant_name()} self-test")
     row("Windows", os.name == "nt")
     row("nova_skills.py next to assistant.py", skills is not None)
     row("nova_voice.py next to assistant.py", voice_mod is not None)
@@ -1946,6 +2131,9 @@ def main():
         return
     if "--quick-ask-ui" in sys.argv:
         run_quick_ask_ui()
+        return
+    if "--customize" in sys.argv:
+        run_customize_ui()
         return
     if "--ask" in sys.argv:
         idx = sys.argv.index("--ask")

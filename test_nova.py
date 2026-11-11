@@ -720,6 +720,72 @@ class NovaTests(unittest.TestCase):
             assistant.handle("call me back")
         self.assertEqual(nova_skills.get_user_name(), "Cobby")
 
+    def test_customize_assistant_name_multiuser_and_reset(self):
+        self.assertEqual(nova_skills.get_assistant_name(), "Nova")
+        reply = assistant.handle("change your name to Jarvis")
+        self.assertIn("jarvis", reply.lower())
+        self.assertEqual(nova_skills.get_assistant_name(), "Jarvis")
+        self.assertEqual(assistant.find_wake("hey jarvis open notepad"), "open notepad")
+        self.assertIsNone(assistant.find_wake("nova open notepad"))
+        self.assertIn("i'm jarvis", assistant.handle("who are you").lower())
+        self.assertIn("you are jarvis", nova_skills._system().lower())
+        with self.assertRaises(SystemExit):
+            assistant.handle("quit jarvis")
+        with mock.patch.object(nova_skills, "weather", return_value=""):
+            self.assertIn("good ", assistant.handle("good morning jarvis").lower())
+
+        assistant.handle("my name is Cobby")
+        assistant.handle("switch user to Alex")
+        self.assertEqual(nova_skills.get_user_name(), "Alex")
+        users_msg = assistant.handle("list users")
+        self.assertIn("Cobby", users_msg)
+        self.assertIn("Alex", users_msg)
+
+        nova_skills.update_profile(assistant_name="Atlas", voice_engine="sapi", voice_name="en-US-GuyNeural")
+        prof = nova_skills.get_profile()
+        self.assertEqual(prof["assistant_name"], "Atlas")
+        self.assertEqual(prof["voice_engine"], "sapi")
+        self.assertEqual(prof["voice_name"], "en-US-GuyNeural")
+
+        nova_skills.reset_personal_data()
+        self.assertEqual(nova_skills.get_assistant_name(), "Nova")
+        self.assertEqual(nova_skills.get_user_name(), "")
+
+    def test_app_packager_and_installer_isolation(self):
+        import zipfile
+        import build_app
+        import install_nova
+
+        with tempfile.TemporaryDirectory() as pkg_tmp:
+            staged = build_app.stage_clean_files(Path(pkg_tmp) / "stage")
+            self.assertTrue((staged / "Install_Nova.bat").exists())
+            self.assertFalse((staged / ".env").exists())
+            z = build_app.build_portable_zip(staged, out_dir=Path(pkg_tmp) / "out")
+            with zipfile.ZipFile(z) as zf:
+                names = set(zf.namelist())
+            self.assertIn("NovaAssistant/assistant.py", names)
+            self.assertIn("NovaAssistant/Install_Nova.bat", names)
+            self.assertNotIn("NovaAssistant/.env", names)
+
+            dest = Path(pkg_tmp) / "install_dest"
+            sm_dir = Path(pkg_tmp) / "StartMenu"
+            desk_lnk = Path(pkg_tmp) / "Desktop" / "Nova Assistant.lnk"
+            desk_lnk.parent.mkdir(parents=True, exist_ok=True)
+            vbs = Path(pkg_tmp) / "Startup" / "Nova.vbs"
+            with mock.patch.object(install_nova, "start_menu_dir", return_value=sm_dir), \
+                 mock.patch.object(install_nova, "desktop_shortcut_path", return_value=desk_lnk), \
+                 mock.patch.object(install_nova, "startup_vbs_path", return_value=vbs), \
+                 mock.patch.object(install_nova, "create_shortcut", side_effect=lambda p, *a, **k: p.parent.mkdir(parents=True, exist_ok=True) or p.write_text("lnk")), \
+                 mock.patch.object(install_nova, "register_uninstall") as reg, \
+                 mock.patch("subprocess.Popen"):
+                out_dest = install_nova.install_app(dest_dir=dest, autostart=True, desktop=True, launch_now=False)
+            self.assertEqual(out_dest, dest.resolve())
+            self.assertTrue((dest / "assistant.py").exists())
+            self.assertTrue((sm_dir / "Customize Assistant.lnk").exists())
+            self.assertTrue(desk_lnk.exists())
+            self.assertTrue(vbs.exists())
+            reg.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
