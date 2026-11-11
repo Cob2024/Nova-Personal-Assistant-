@@ -32,6 +32,7 @@ HOME = Path.home()
 DATA = HOME / ".laptop_assistant"
 DATA.mkdir(exist_ok=True)
 UNDO_FILE, REM_FILE, CONFIG_FILE = DATA / "last_move.json", DATA / "reminders.json", DATA / "config.json"
+ROUTINES_FILE = DATA / "routines.json"
 NOTES = HOME / "Documents" / "Nova Notes.txt"
 ENV_FILE = Path(__file__).resolve().parent / ".env"
 IS_WIN = os.name == "nt"
@@ -1049,6 +1050,152 @@ class _TextHTMLParser(HTMLParser):
                 self.parts.append(s)
 
 
+DEFAULT_ROUTINES = {
+    "focus mode": ["set volume to 25", "open vs code", "set a timer for 50 minutes"],
+    "break time": ["set volume to 50", "set a timer for 10 minutes", "list my tasks"],
+    "morning routine": ["daily briefing", "list my tasks"],
+    "night mode": ["set brightness to 25", "set volume to 25"],
+}
+_routine_depth = 0
+
+
+def load_routines():
+    try:
+        saved = json.loads(ROUTINES_FILE.read_text(encoding="utf-8"))
+        if isinstance(saved, dict):
+            return {**DEFAULT_ROUTINES, **{k.lower(): v for k, v in saved.items() if isinstance(v, list)}}
+    except Exception:
+        pass
+    return dict(DEFAULT_ROUTINES)
+
+
+def save_routine(name, steps):
+    key = " ".join(name.lower().split())
+    clean_steps = [s.strip() for s in steps if s and s.strip()]
+    if not key or not clean_steps:
+        return "Give a routine name and at least one step."
+    with _lock:
+        try:
+            saved = json.loads(ROUTINES_FILE.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                saved = {}
+        except Exception:
+            saved = {}
+        saved[key] = clean_steps
+        ROUTINES_FILE.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    return f"Saved routine {key} with {len(clean_steps)} steps."
+
+
+def delete_routine(name):
+    key = " ".join(name.lower().split())
+    with _lock:
+        try:
+            saved = json.loads(ROUTINES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            saved = {}
+        if key not in saved:
+            return f"I didn't find a custom routine called {key}."
+        del saved[key]
+        ROUTINES_FILE.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    return f"Deleted routine {key}."
+
+
+def list_routines():
+    r = load_routines()
+    return "Available routines: " + ", ".join(sorted(r)) + "."
+
+
+def run_routine(name):
+    global _routine_depth
+    if _routine_depth >= 2:
+        return "Stopped nested routine loop."
+    routines = load_routines()
+    key = " ".join(name.lower().split())
+    if key not in routines:
+        m = difflib.get_close_matches(key, list(routines), n=1, cutoff=0.75)
+        key = m[0] if m else None
+    if not key:
+        return f"I don't have a routine called {name.strip()}."
+    steps = routines[key]
+    runner = ctx.get("handle") or (lambda s: route(s.lower(), s))
+    results = []
+    _routine_depth += 1
+    try:
+        for step in steps:
+            out = runner(step)
+            if out:
+                results.append(out)
+    finally:
+        _routine_depth -= 1
+    return " ".join(results[:4]) if results else f"Ran {key}."
+
+
+def _find_repo(repo_hint=""):
+    hint = repo_hint.strip().strip("\"'")
+    if not hint:
+        return Path(__file__).resolve().parent
+    p = Path(hint)
+    if p.exists():
+        return p
+    for base in (HOME / "Documents", HOME / "Desktop", HOME):
+        if not base.exists():
+            continue
+        for child in base.iterdir():
+            if child.is_dir() and child.name.lower() == hint.lower() and (child / ".git").exists():
+                return child
+    return None
+
+
+def git_status(repo=""):
+    target = _find_repo(repo)
+    if not target or not (target / ".git").exists():
+        return f"I couldn't find a git repository{f' named {repo}' if repo else ''}."
+    try:
+        r = subprocess.run(["git", "-C", str(target), "status", "--short", "--branch"],
+                           capture_output=True, text=True, timeout=5,
+                           stdin=subprocess.DEVNULL, creationflags=NOWIN)
+    except Exception as err:
+        return f"Could not run git ({err})."
+    if r.returncode != 0:
+        return f"Git failed in {target.name}."
+    lines = [l for l in r.stdout.splitlines() if l.strip()]
+    branch = lines[0].replace("## ", "").split("...")[0] if lines else "unknown"
+    changes = len(lines) - 1
+    if changes <= 0:
+        return f"{target.name} is on branch {branch} with a clean working tree."
+    return f"{target.name} is on branch {branch} with {changes} uncommitted change{'s' * (changes != 1)}."
+
+
+def github_status():
+    try:
+        auth = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True,
+                              timeout=5, stdin=subprocess.DEVNULL, creationflags=NOWIN)
+    except FileNotFoundError:
+        return "GitHub CLI is not installed."
+    except Exception as err:
+        return f"Could not check GitHub ({err})."
+    if auth.returncode != 0:
+        return "GitHub CLI is not logged in yet. Run gh auth login in a terminal."
+    r = subprocess.run(["gh", "status"], capture_output=True, text=True,
+                       timeout=10, stdin=subprocess.DEVNULL, creationflags=NOWIN)
+    out = " ".join((r.stdout or r.stderr).split())
+    return out[:280] if out else "GitHub has no active notifications or pull requests."
+
+
+def _exec_shell(cmd):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20,
+                           stdin=subprocess.DEVNULL, creationflags=NOWIN)
+        out = " ".join((r.stdout or r.stderr).split()).strip()
+        if r.returncode == 0:
+            return out[:240] if out else "Command finished."
+        return f"Command exited with code {r.returncode}. {out[:180]}".strip()
+    except subprocess.TimeoutExpired:
+        return "That command timed out after 20 seconds."
+    except Exception as err:
+        return f"Command failed: {err}"
+
+
 def read_webpage(url):
     """Fetch an http/https webpage and extract clean readable text (up to 4000 chars)."""
     u = url.strip()
@@ -1291,6 +1438,12 @@ TOOLS = [
     _tool("system_diagnostics", "Detailed live diagnostics: RAM usage, uptime, battery, and disk space.", {}),
     _tool("top_processes", "List the running apps using the most RAM.", {"count?": "number"}),
     _tool("read_webpage", "Fetch readable text from an http or https URL.", {"url": "string"}),
+    _tool("run_routine", "Execute a saved multi-step routine by name (e.g. focus mode, break time).", {"name": "string"}),
+    _tool("save_routine", "Create or update a named multi-step routine.", {"name": "string", "steps_csv": "string"}),
+    _tool("list_routines", "List available routines.", {}),
+    _tool("delete_routine", "Delete a custom routine by name.", {"name": "string"}),
+    _tool("git_status", "Check git branch and uncommitted changes in a repository.", {"repo?": "string"}),
+    _tool("github_status", "Check GitHub PRs, issues, and notifications via gh CLI.", {}),
     _tool("take_screenshot", "Save a screenshot of the screen.", {}),
 ]
 FUNCS = {
@@ -1322,6 +1475,12 @@ FUNCS = {
     "system_diagnostics": system_diagnostics,
     "top_processes": lambda count=3: top_processes(int(count)),
     "read_webpage": read_webpage,
+    "run_routine": run_routine,
+    "save_routine": lambda name, steps_csv: save_routine(name, [s.strip() for s in re.split(r"[,;\n]+", steps_csv)]),
+    "list_routines": list_routines,
+    "delete_routine": delete_routine,
+    "git_status": git_status,
+    "github_status": github_status,
     "take_screenshot": screenshot,
 }
 
@@ -1917,6 +2076,28 @@ def dictate(raw, t):
 
 def route(t, raw):
     """Match a cleaned command to an ability. Returns a reply, or None if it's not mine."""
+    # --- routines, mic calibration & dev commands ---
+    if re.search(r"\b(recalibrate|calibrate)\b.*\b(mic|microphone|noise)\b", t):
+        return ctx["recalibrate"]() if "recalibrate" in ctx else "Microphone calibration is only available in voice mode."
+    if re.search(r"\b(list|show|what)\b.*\broutines?\b", t):
+        return list_routines()
+    if m := re.match(r"(?:delete|remove)\s+routine\s+(.+)", t):
+        return delete_routine(m.group(1))
+    if m := re.match(r"(?:create|save|add|make)\s+(?:a\s+)?routine\s+(?:called\s+|named\s+)?(.+?)\s+to\s+(.+)", t):
+        steps = [s.strip() for s in re.split(r"\s+(?:and then|then|and)\s+|[,;]+", m.group(2)) if s.strip()]
+        return save_routine(m.group(1), steps)
+    if m := re.match(r"(?:run|start)\s+(?:the\s+)?routine\s+(.+)", t):
+        return run_routine(m.group(1))
+    if re.sub(r"^(?:start|run)\s+", "", t) in load_routines():
+        return run_routine(re.sub(r"^(?:start|run)\s+", "", t))
+    if m := re.search(r"\bgit status(?:\s+(?:in|for)\s+(.+))?$|\bwhat branch am i on\b", t):
+        return git_status((m.group(1) or "") if m.lastindex else "")
+    if re.search(r"\b(github status|check github|my pull requests)\b", t):
+        return github_status()
+    if m := re.search(r"(?:^|\s)(?:run|execute)\s+(?:the\s+)?command\s+(.+)$", raw.strip(), re.I):
+        cmd = m.group(1).strip()
+        return confirm(f"Run command {cmd}?", lambda: _exec_shell(cmd))
+
     # --- memory, screen & active window ---
     if re.search(r"\b(what's|what is|read|look at|see|check|describe|explain)\b.*\b(on my screen|my screen|this screen)\b", t):
         return inspect_screen(raw)

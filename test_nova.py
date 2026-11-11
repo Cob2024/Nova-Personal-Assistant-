@@ -18,6 +18,7 @@ class NovaTests(unittest.TestCase):
         self._orig_cfg = nova_skills.CONFIG_FILE
         self._orig_rem = nova_skills.REM_FILE
         self._orig_notes = nova_skills.NOTES
+        self._orig_routines = nova_skills.ROUTINES_FILE
         self._orig_tasks = assistant.TASKS_FILE
         self._orig_mem = nova_skills._mem
         self.tmp = tempfile.TemporaryDirectory()
@@ -25,6 +26,7 @@ class NovaTests(unittest.TestCase):
         nova_skills.CONFIG_FILE = tmp_path / "config.json"
         nova_skills.REM_FILE = tmp_path / "reminders.json"
         nova_skills.NOTES = tmp_path / "Nova Notes.txt"
+        nova_skills.ROUTINES_FILE = tmp_path / "routines.json"
         assistant.TASKS_FILE = tmp_path / "tasks.json"
         nova_skills._mem = nova_memory.Memory(tmp_path / "memory.db")
         nova_skills.reset_ai()
@@ -34,6 +36,7 @@ class NovaTests(unittest.TestCase):
         nova_skills.CONFIG_FILE = self._orig_cfg
         nova_skills.REM_FILE = self._orig_rem
         nova_skills.NOTES = self._orig_notes
+        nova_skills.ROUTINES_FILE = self._orig_routines
         assistant.TASKS_FILE = self._orig_tasks
         nova_skills._mem = self._orig_mem
         nova_skills.reset_ai()
@@ -477,6 +480,65 @@ class NovaTests(unittest.TestCase):
              mock.patch.object(nova_skills, "weather", return_value="Clear, 22 degrees."):
             b = nova_skills.briefing()
             self.assertIn("20 percent and unplugged", b.lower())
+
+    def test_routines_lifecycle_and_recursion_guard(self):
+        self.assertIn("focus mode", assistant.handle("list routines").lower())
+        res = assistant.handle("create routine study time to add task review notes and set a timer for 25 minutes")
+        self.assertIn("saved routine study time", res.lower())
+        out = assistant.handle("study time")
+        self.assertIn("review notes", out.lower())
+        self.assertIn("25 minutes", out.lower())
+        # Prevent infinite self-recursion
+        nova_skills.save_routine("loop test", ["run routine loop test"])
+        loop_out = nova_skills.run_routine("loop test")
+        self.assertIn("stopped", loop_out.lower())
+        self.assertIn("deleted", assistant.handle("delete routine study time").lower())
+
+    def test_git_github_and_confirmed_shell(self):
+        gs = assistant.handle("git status")
+        self.assertIn("branch main", gs.lower())
+        self.assertIn("couldn't find", nova_skills.git_status("nonexistent_repo_xyz").lower())
+
+        with mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=1, stdout="", stderr="not logged in")):
+            self.assertIn("gh auth login", assistant.handle("github status").lower())
+
+        # Shell command must ask confirmation first, never run unconfirmed
+        with mock.patch.object(nova_skills, "_exec_shell", return_value="hi") as m:
+            prompt = assistant.handle("please run command echo hi")
+            self.assertIn("run command echo hi", prompt.lower())
+            m.assert_not_called()
+            reply = assistant.handle("yes")
+            self.assertEqual(reply, "hi")
+            m.assert_called_once_with("echo hi")
+
+    def test_mic_recalibrate_and_low_peak_gate(self):
+        import numpy as np
+        mic = assistant.Mic.__new__(assistant.Mic)
+        mic.np = np
+        mic.sr = 16000
+        mic.ambient = 0.01
+        mic.model = mock.Mock()
+        mic.voice_lock = None
+        quiet_pulse = np.full((1600, 1), 0.005, dtype=np.float32)
+        silent = np.zeros((1600, 1), dtype=np.float32)
+
+        class FakeStream:
+            read_available = 0
+            def __init__(self, items):
+                self.items = list(items)
+            def read(self, n):
+                if len(self.items) == 1 and n == 16000:
+                    return self.items[0]
+                return self.items.pop(0)
+
+        mic.ambient = 0.0005
+        mic.stream = FakeStream([(quiet_pulse, False)] * 5 + [(silent, False)] * 12)
+        self.assertEqual(mic.listen(wait=5), "")
+        mic.model.transcribe.assert_not_called()
+
+        mic.stream = FakeStream([(np.full((16000, 1), 0.02, dtype=np.float32), False)])
+        self.assertEqual(mic.recalibrate(), "Microphone recalibrated.")
+        self.assertAlmostEqual(mic.ambient, 0.02, places=4)
 
 
 if __name__ == "__main__":

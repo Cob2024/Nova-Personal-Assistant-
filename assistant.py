@@ -218,6 +218,10 @@ class Mic:
     def _level(self, block):
         return float(self.np.abs(block).mean())
 
+    def recalibrate(self):
+        self.ambient = self._level(self.stream.read(self.sr)[0])
+        return "Microphone recalibrated."
+
     def listen(self, wait=8, max_seconds=15, commands=False, wake_event=None):
         """Wait up to `wait` seconds for speech; return what was said ('' if nothing)."""
         np = self.np
@@ -263,6 +267,8 @@ class Mic:
         if loud < 3:                         # a click or a cough, not speech
             return ""
         audio = np.concatenate(chunks).flatten()
+        if len(audio) < int(self.sr * 0.25) or float(np.max(np.abs(audio))) < 0.008:
+            return ""
         if self.voice_lock and self.voice_lock.ready and voice_mod:
             speech = voice_mod.trim_silence(audio, self.sr)
             if len(speech) == 0:
@@ -560,12 +566,17 @@ def alert(kind, text):
     UI.post("hide")
 
 
+_mic = None
+
+
 def setup_skills():
     if not skills:
         print("(nova_skills.py not found next to assistant.py: only the basic commands are available)")
         return
     skills.configure(ask=ask, is_yes=is_yes, alert=alert, load_tasks=load_tasks,
-                     add_task=add_task, list_tasks=list_tasks, change_task=change_task)
+                     add_task=add_task, list_tasks=list_tasks, change_task=change_task,
+                     handle=handle,
+                     recalibrate=lambda: _mic.recalibrate() if _mic else "Microphone calibration is only available in voice mode.")
     skills.start_scheduler()
 
 
@@ -1521,7 +1532,8 @@ def run_voice():
                 print(f"   (voice lock active, threshold {vl.threshold:.2f})")
             elif vl.error:
                 print(f"   (voice lock disabled: {vl.error})")
-    mic = Mic(voice_lock=voice_lock)
+    global _mic
+    mic = _mic = Mic(voice_lock=voice_lock)
     say("Nova is online." if background else f"I'm ready. Just say {NAME} when you need me.")
     if not skills:
         say("My abilities file is missing, so I can only do the basics. Put nova skills dot pie next to my main file.")
