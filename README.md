@@ -42,6 +42,8 @@ py -3.12 assistant.py --setup-ai
 
 ## Usage
 
+See [COMMANDS.md](COMMANDS.md) for the complete reference of every offline laptop command, shortcut, routine, calculator/converter phrase, and AI feature.
+
 ```powershell
 py -3.12 assistant.py                 # Voice mode + Dynamic Island orb
 py -3.12 assistant.py --text          # Text chat mode in terminal

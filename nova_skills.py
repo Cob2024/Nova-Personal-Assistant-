@@ -2,6 +2,7 @@
 Nova's abilities: laptop control, timers & reminders, smarter files & notes, AI brain.
 Keep this file next to assistant.py. The AI brain also needs:  pip install anthropic
 """
+import ast
 import atexit
 import base64
 import csv
@@ -10,9 +11,12 @@ import difflib
 from html.parser import HTMLParser
 import io
 import json
+import math
+import operator
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -94,7 +98,11 @@ def ps(script, **env):
 
 
 VK = {"mute": 0xAD, "down": 0xAE, "up": 0xAF, "next": 0xB0, "prev": 0xB1, "play": 0xB3,
-      "alt": 0x12, "f4": 0x73, "win": 0x5B, "d": 0x44, "ctrl": 0x11, "v": 0x56}
+      "alt": 0x12, "f4": 0x73, "win": 0x5B, "d": 0x44, "ctrl": 0x11, "shift": 0x10,
+      "tab": 0x09, "pgup": 0x21, "pgdn": 0x22, "end": 0x23, "home": 0x24,
+      "left_arrow": 0x25, "up_arrow": 0x26, "right_arrow": 0x27, "down_arrow": 0x28,
+      "a": 0x41, "c": 0x43, "f": 0x46, "r": 0x52, "t": 0x54, "v": 0x56, "w": 0x57,
+      "x": 0x58, "y": 0x59, "z": 0x5A}
 
 
 def press(*keys, times=1):
@@ -105,6 +113,44 @@ def press(*keys, times=1):
         for k in reversed(keys):
             u.keybd_event(VK[k], 0, 2, 0)
         time.sleep(0.004)
+
+
+_SHORTCUTS = {
+    "maximize": (("win", "up_arrow"), "Maximized window."),
+    "minimize": (("win", "down_arrow"), "Minimized window."),
+    "snap_left": (("win", "left_arrow"), "Snapped window left."),
+    "snap_right": (("win", "right_arrow"), "Snapped window right."),
+    "switch_window": (("alt", "tab"), "Switched window."),
+    "new_tab": (("ctrl", "t"), "Opened a new tab."),
+    "close_tab": (("ctrl", "w"), "Closed the tab."),
+    "reopen_tab": (("ctrl", "shift", "t"), "Reopened the tab."),
+    "next_tab": (("ctrl", "tab"), "Switched to the next tab."),
+    "prev_tab": (("ctrl", "shift", "tab"), "Switched to the previous tab."),
+    "refresh": (("ctrl", "r"), "Refreshed."),
+    "find_on_page": (("ctrl", "f"), "Opened find."),
+    "copy": (("ctrl", "c"), "Copied."),
+    "paste": (("ctrl", "v"), "Pasted."),
+    "cut": (("ctrl", "x"), "Cut."),
+    "select_all": (("ctrl", "a"), "Selected all."),
+    "undo_edit": (("ctrl", "z"), "Undid the last edit."),
+    "redo": (("ctrl", "y"), "Redid the last edit."),
+    "scroll_down": (("pgdn",), "Scrolled down."),
+    "scroll_up": (("pgup",), "Scrolled up."),
+    "scroll_top": (("ctrl", "home"), "Scrolled to the top."),
+    "scroll_bottom": (("ctrl", "end"), "Scrolled to the bottom."),
+}
+
+
+def window_action(action):
+    """Execute a standard Windows window, browser tab, scrolling, or editing shortcut."""
+    if not IS_WIN:
+        return WIN_ONLY
+    spec = _SHORTCUTS.get(action)
+    if not spec:
+        return None
+    keys, reply = spec
+    press(*keys)
+    return reply
 
 
 def open_path(p):
@@ -278,12 +324,31 @@ def volume_mute(mute=None):
     return "Done."
 
 
+def volume_status():
+    if not IS_WIN:
+        return WIN_ONLY
+    res = _audio_cmd("get", 0)
+    if res is None:
+        return "I couldn't check the current volume."
+    pct, muted = res
+    return f"Volume is muted, currently at {pct} percent." if muted else f"Volume is at {pct} percent."
+
+
 def media(action):
     if not IS_WIN:
         return WIN_ONLY
     key = "next" if re.search(r"next|skip", action) else "prev" if re.search(r"prev|back|last", action) else "play"
     press(key)
     return {"next": "Skipping.", "prev": "Going back.", "play": "Done."}[key]
+
+
+def brightness_status():
+    if not IS_WIN:
+        return WIN_ONLY
+    cur = ps("(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness").stdout.strip()
+    if not cur.isdigit():
+        return "I couldn't read the brightness on this display."
+    return f"Brightness is at {cur} percent."
 
 
 def brightness(set_to=None, delta=0):
@@ -304,7 +369,9 @@ APPS = {"chrome": "chrome", "google chrome": "chrome", "edge": "msedge", "micros
         "teams": "msteams:", "spotify": "spotify:", "settings": "ms-settings:", "file explorer": "explorer",
         "explorer": "explorer", "task manager": "taskmgr", "terminal": "wt", "command prompt": "cmd",
         "cmd": "cmd", "vs code": "code", "vscode": "code", "visual studio code": "code",
-        "whatsapp": "whatsapp:", "camera": "microsoft.windows.camera:", "store": "ms-windows-store:",
+        "whatsapp": "whatsapp:", "what's up": "whatsapp:", "whats up": "whatsapp:",
+        "telegram": "tg:", "discord": "discord:", "slack": "slack:", "vlc": "vlc",
+        "camera": "microsoft.windows.camera:", "store": "ms-windows-store:",
         "clock": "ms-clock:", "snipping tool": "snippingtool", "control panel": "control", "zoom": "zoom"}
 SITES = {"youtube": "https://www.youtube.com", "google": "https://www.google.com",
          "gmail": "https://mail.google.com", "github": "https://github.com",
@@ -344,8 +411,10 @@ PROCS = {"chrome": "chrome.exe", "google chrome": "chrome.exe", "edge": "msedge.
          "notepad": "notepad.exe", "word": "WINWORD.EXE", "excel": "EXCEL.EXE", "powerpoint": "POWERPNT.EXE",
          "outlook": "OUTLOOK.EXE", "spotify": "Spotify.exe", "teams": "ms-teams.exe",
          "calculator": "CalculatorApp.exe", "vs code": "Code.exe", "vscode": "Code.exe",
-         "task manager": "Taskmgr.exe", "paint": "mspaint.exe", "zoom": "Zoom.exe", "whatsapp": "WhatsApp.exe",
-         "discord": "Discord.exe", "slack": "slack.exe", "vlc": "vlc.exe"}
+         "task manager": "Taskmgr.exe", "paint": "mspaint.exe", "zoom": "Zoom.exe",
+         "whatsapp": "WhatsApp.exe", "what's up": "WhatsApp.exe", "whats up": "WhatsApp.exe",
+         "terminal": "WindowsTerminal.exe", "command prompt": "cmd.exe", "cmd": "cmd.exe",
+         "snipping tool": "SnippingTool.exe", "discord": "Discord.exe", "slack": "slack.exe", "vlc": "vlc.exe"}
 
 
 def _lookup(table, key, cutoff=0.8):
@@ -428,10 +497,38 @@ def top_processes(n=3):
     return "Top memory users are " + ", ".join(parts) + "."
 
 
+def running_apps_text(limit=8):
+    """List top active user-facing applications currently running."""
+    if not IS_WIN:
+        return WIN_ONLY
+    ignore = {"memory compression", "system", "idle", "svchost", "registry", "smss", "csrss",
+              "wininit", "services", "lsass", "fontdrvhost", "dwm", "conhost", "runtimebroker",
+              "searchhost", "shellexperiencehost", "startmenuexperiencehost", "textinputhost",
+              "taskhostw", "sihost", "ctfmon", "dllhost", "audiodg", "spoolsv", "wmiprvse"}
+    totals, display = {}, {}
+    for exe, _, kb in _running_procs():
+        name = re.sub(r"\.exe$", "", exe, flags=re.I)
+        low = name.lower()
+        if not low or low in ignore:
+            continue
+        totals[low] = totals.get(low, 0) + kb
+        display.setdefault(low, name)
+    if not totals:
+        return "I couldn't inspect running apps."
+    top = [display[k] for k, _ in sorted(totals.items(), key=lambda x: x[1], reverse=True)[:max(1, int(limit))]]
+    if len(top) == 1:
+        return f"Currently running: {top[0]}."
+    return "Currently running apps include " + ", ".join(top[:-1]) + f", and {top[-1]}."
+
+
 def close_app(name):
     if not IS_WIN:
         return None
-    raw = name.strip().lower()
+    raw = re.sub(r"^(?:(?:the|my|that)\s+)+", "", name.strip().lower())
+    raw = re.sub(r"(?:\s+(?:app|application|window|program|please|hello|hi|hey|now|thanks|thank you))+$",
+                 "", raw).strip()
+    if not raw:
+        return None
     exe = _lookup(PROCS, raw, 0.8)
     if not exe:
         running = {re.sub(r"\.exe$", "", p[0], flags=re.I).lower(): p[0] for p in _running_procs()}
@@ -440,7 +537,7 @@ def close_app(name):
         return None
     r = subprocess.run(["taskkill", "/IM", exe], capture_output=True, text=True,
                        stdin=subprocess.DEVNULL, creationflags=NOWIN)      # polite close, asks about unsaved work
-    return f"Closing {name.strip()}." if r.returncode == 0 else f"{name.strip().title()} doesn't seem to be running."
+    return f"Closing {raw}." if r.returncode == 0 else f"{raw.title()} doesn't seem to be running."
 
 
 def empty_recycle_bin():
@@ -514,6 +611,13 @@ def clipboard():
     if not IS_WIN:
         return ""
     return ps("Get-Clipboard -Raw").stdout.strip()
+
+
+def clear_clipboard():
+    if not IS_WIN:
+        return WIN_ONLY
+    ps("Set-Clipboard -Value ''")
+    return "Clipboard cleared."
 
 
 def type_text(text):
@@ -590,6 +694,31 @@ def wifi():
                          stdin=subprocess.DEVNULL, creationflags=NOWIN).stdout
     m = re.search(r"^\s*SSID\s*:\s*(.+)$", out, re.M)
     return f"You're connected to {m.group(1).strip()}." if m else "You're not connected to Wi-Fi."
+
+
+def local_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+    except OSError:
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+        except OSError:
+            ip = ""
+    return f"Your local IP address is {ip}." if ip else "I couldn't find your local IP address."
+
+
+def internet_status():
+    try:
+        with socket.create_connection(("1.1.1.1", 443), timeout=2.0):
+            online = True
+    except OSError:
+        online = False
+    if IS_WIN:
+        w = wifi()
+        return f"You're online. {w}" if online else f"You appear to be offline. {w}"
+    return "You're online." if online else "You appear to be offline."
 
 
 def system_status():
@@ -903,8 +1032,11 @@ def newest(folder):
 
 
 def open_thing(name, interactive=True):
-    key = re.sub(r"^(?:(?:the|my|up|a) )+", "", name.lower().strip())
-    key = re.sub(r"\s+(?:app|application|website|site|page|folder|please)$", "", key).strip()
+    key = re.sub(r"^(?:(?:the|my|up|a|that)\s+)+", "", name.lower().strip())
+    key = re.sub(r"(?:\s+(?:app|application|website|site|page|folder|please|hello|hi|hey|now|thanks|thank you))+$",
+                 "", key).strip()
+    if not key:
+        return None
     if key in ("tasks", "task", "to do list", "todo list", "to do"):
         return None
     for table in (APPS, SHELL):                                    # apps and special Windows places
@@ -944,7 +1076,7 @@ def open_thing(name, interactive=True):
     if launch(name):
         return f"Opening {key}."
     msg = f"I couldn't find anything called {key}."
-    return None if ai_ready() else msg                             # with the AI brain, let it have a go
+    return None if (ai_ready() and not ai_blocked()) else msg      # with a working AI brain, let it have a go
 
 
 def unique(p):
@@ -1257,6 +1389,21 @@ AI_HINT = ("I can answer general questions once my AI brain is set up. "
            "Run assistant.py with --setup-ai to connect Claude, Ollama Cloud, OpenAI, Gemini, or local Ollama.")
 _history = []
 _mem = None
+_AI_COOLDOWN_SECS = 600.0
+_ai_blocked_until = 0.0
+_ai_blocked_msg = ""
+
+
+def ai_blocked():
+    """True while recent billing or auth errors paused outbound AI calls."""
+    return time.monotonic() < _ai_blocked_until
+
+
+def reset_ai_cooldown():
+    """Clear any AI billing/auth cooldown so the next request tries again."""
+    global _ai_blocked_until, _ai_blocked_msg
+    _ai_blocked_until = 0.0
+    _ai_blocked_msg = ""
 
 
 def _memory():
@@ -1929,10 +2076,20 @@ def _ai_error_reply(provider, err):
     return "I couldn't reach my AI brain. Check your internet connection and API key."
 
 
+def _record_ai_error(provider, err):
+    global _ai_blocked_until, _ai_blocked_msg
+    msg = _ai_error_reply(provider, err)
+    err_text = str(err)
+    if any(code in err_text for code in ("HTTP 402", "HTTP 401", "HTTP 403")):
+        _ai_blocked_until = time.monotonic() + _AI_COOLDOWN_SECS
+        _ai_blocked_msg = msg
+    return msg
+
+
 def ask_ai(text, on_sentence=None, stop_event=None):
-    """Returns Nova's reply, or None if the AI brain isn't set up. Streams sentences if on_sentence is given."""
+    """Returns Nova's reply, or None if the AI brain isn't set up or is in billing/auth cooldown."""
     ready, provider, model = ai_status()
-    if not ready:
+    if not ready or ai_blocked():
         return None
     _, key, _, base_url = _ai_settings()
     try:
@@ -1960,6 +2117,7 @@ def ask_ai(text, on_sentence=None, stop_event=None):
             reply = _ask_ollama(text, model, base_url)
         else:
             return f"Unknown AI provider: {provider}."
+        reset_ai_cooldown()
         if stop_event and stop_event.is_set() and not reply:
             return ""
         _history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
@@ -1970,7 +2128,7 @@ def ask_ai(text, on_sentence=None, stop_event=None):
         return reply
     except Exception as err:
         print("AI error:", err)
-        msg = _ai_error_reply(provider, err)
+        msg = _record_ai_error(provider, err)
         if on_sentence is not None and not (stop_event and stop_event.is_set()):
             on_sentence(msg)
         return msg
@@ -1981,6 +2139,8 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
     ready, provider, model = ai_status()
     if not ready:
         return AI_HINT
+    if ai_blocked():
+        return _ai_blocked_msg or "My AI brain is unavailable until the account issue is resolved."
     _, key, _, base_url = _ai_settings()
     try:
         if provider == "anthropic":
@@ -2030,10 +2190,11 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
         m = _memory()
         if m:
             m.add_episode(question, reply)
+        reset_ai_cooldown()
         return reply
     except Exception as err:
         print("AI vision error:", err)
-        return _ai_error_reply(provider, err)
+        return _record_ai_error(provider, err)
 
 
 def setup_ai():
@@ -2091,6 +2252,7 @@ def setup_ai():
         cfg["model"] = model
 
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    reset_ai_cooldown()
     print(f"Saved to {CONFIG_FILE}. Testing...")
     print(ask_ai("Say hello in five words.") or "No reply.")
 
@@ -2101,7 +2263,148 @@ def ai_about_clipboard(raw):
         return "Your clipboard is empty."
     if not ai_ready():
         return AI_HINT
-    return ask_ai(f"{raw}\n\nClipboard contents:\n{text[:6000]}")
+    if ai_blocked():
+        return _ai_blocked_msg or "My AI brain is unavailable until the account issue is resolved."
+    return ask_ai(f"{raw}\n\nClipboard contents:\n{text[:6000]}") or "My AI brain is unavailable right now."
+
+
+# ============ offline math & unit conversion ============
+_LENGTH_UNITS = {
+    "mm": ("millimeters", 0.001), "millimeter": ("millimeters", 0.001), "millimeters": ("millimeters", 0.001),
+    "cm": ("centimeters", 0.01), "centimeter": ("centimeters", 0.01), "centimeters": ("centimeters", 0.01),
+    "m": ("meters", 1.0), "meter": ("meters", 1.0), "meters": ("meters", 1.0),
+    "km": ("kilometers", 1000.0), "kilometer": ("kilometers", 1000.0), "kilometers": ("kilometers", 1000.0),
+    "in": ("inches", 0.0254), "inch": ("inches", 0.0254), "inches": ("inches", 0.0254),
+    "ft": ("feet", 0.3048), "foot": ("feet", 0.3048), "feet": ("feet", 0.3048),
+    "yd": ("yards", 0.9144), "yard": ("yards", 0.9144), "yards": ("yards", 0.9144),
+    "mi": ("miles", 1609.344), "mile": ("miles", 1609.344), "miles": ("miles", 1609.344),
+}
+_WEIGHT_UNITS = {
+    "mg": ("milligrams", 0.001), "milligram": ("milligrams", 0.001), "milligrams": ("milligrams", 0.001),
+    "g": ("grams", 1.0), "gram": ("grams", 1.0), "grams": ("grams", 1.0),
+    "kg": ("kilograms", 1000.0), "kilo": ("kilograms", 1000.0), "kilos": ("kilograms", 1000.0),
+    "kilogram": ("kilograms", 1000.0), "kilograms": ("kilograms", 1000.0),
+    "oz": ("ounces", 28.349523125), "ounce": ("ounces", 28.349523125), "ounces": ("ounces", 28.349523125),
+    "lb": ("pounds", 453.59237), "lbs": ("pounds", 453.59237),
+    "pound": ("pounds", 453.59237), "pounds": ("pounds", 453.59237),
+}
+_DATA_UNITS = {
+    "b": ("bytes", 1.0), "byte": ("bytes", 1.0), "bytes": ("bytes", 1.0),
+    "kb": ("kilobytes", 1024.0), "kilobyte": ("kilobytes", 1024.0), "kilobytes": ("kilobytes", 1024.0),
+    "mb": ("megabytes", 1024.0 ** 2), "megabyte": ("megabytes", 1024.0 ** 2), "megabytes": ("megabytes", 1024.0 ** 2),
+    "gb": ("gigabytes", 1024.0 ** 3), "gigabyte": ("gigabytes", 1024.0 ** 3), "gigabytes": ("gigabytes", 1024.0 ** 3),
+    "tb": ("terabytes", 1024.0 ** 4), "terabyte": ("terabytes", 1024.0 ** 4), "terabytes": ("terabytes", 1024.0 ** 4),
+}
+_VOLUME_UNITS = {
+    "ml": ("milliliters", 1.0), "milliliter": ("milliliters", 1.0), "milliliters": ("milliliters", 1.0),
+    "l": ("liters", 1000.0), "liter": ("liters", 1000.0), "liters": ("liters", 1000.0),
+    "cup": ("cups", 236.5882365), "cups": ("cups", 236.5882365),
+    "gal": ("gallons", 3785.411784), "gallon": ("gallons", 3785.411784), "gallons": ("gallons", 3785.411784),
+}
+_SPEED_UNITS = {
+    "mph": ("miles per hour", 0.44704),
+    "kph": ("kilometers per hour", 1.0 / 3.6),
+    "kmh": ("kilometers per hour", 1.0 / 3.6),
+}
+_TEMP_UNITS = {
+    "c": "Celsius", "celsius": "Celsius",
+    "f": "Fahrenheit", "fahrenheit": "Fahrenheit",
+    "k": "Kelvin", "kelvin": "Kelvin",
+}
+_AST_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+_AST_UNOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+
+
+def _fmt_num(val):
+    if abs(val - round(val)) < 1e-9:
+        return str(int(round(val)))
+    return f"{val:.4f}".rstrip("0").rstrip(".")
+
+
+def _convert_units(low):
+    norm = re.sub(r"\bdegrees?\s+(celsius|fahrenheit|kelvin|c|f|k)\b", r"\1", low)
+    norm = norm.replace("miles per hour", "mph").replace("kilometers per hour", "kph").replace("km/h", "kph")
+    norm = re.sub(r"[?,!]", "", norm).strip()
+    m = re.match(
+        r"^(?:convert\s+|what(?:'s| is)\s+|how many\s+\S+\s+(?:are\s+)?in\s+)?"
+        r"(-?\d+(?:\.\d+)?)\s*°?\s*([a-z]+)\s+(?:to|in|into)\s+°?\s*([a-z]+)$",
+        norm,
+    )
+    if not m:
+        return None
+    val, src, dst = float(m.group(1)), m.group(2), m.group(3)
+    if src in _TEMP_UNITS and dst in _TEMP_UNITS:
+        c = val if src[0] == "c" else ((val - 32.0) * 5.0 / 9.0 if src[0] == "f" else val - 273.15)
+        out = c if dst[0] == "c" else (c * 9.0 / 5.0 + 32.0 if dst[0] == "f" else c + 273.15)
+        s_lbl = ("degrees " + _TEMP_UNITS[src]) if src[0] in ("c", "f") else _TEMP_UNITS[src]
+        d_lbl = ("degrees " + _TEMP_UNITS[dst]) if dst[0] in ("c", "f") else _TEMP_UNITS[dst]
+        return f"{_fmt_num(val)} {s_lbl} is {_fmt_num(out)} {d_lbl}."
+    for table in (_LENGTH_UNITS, _WEIGHT_UNITS, _DATA_UNITS, _VOLUME_UNITS, _SPEED_UNITS):
+        if src in table and dst in table:
+            s_lbl, s_fac = table[src]
+            d_lbl, d_fac = table[dst]
+            out = val * s_fac / d_fac
+            return f"{_fmt_num(val)} {s_lbl} is {_fmt_num(out)} {d_lbl}."
+    return None
+
+
+def _eval_ast_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_ast_node(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _AST_UNOPS:
+        return _AST_UNOPS[type(node.op)](_eval_ast_node(node.operand))
+    if isinstance(node, ast.BinOp):
+        left, right = _eval_ast_node(node.left), _eval_ast_node(node.right)
+        if isinstance(node.op, ast.Pow):
+            if abs(right) > 1000 or abs(left) > 1e6:
+                raise ValueError("exponent too large")
+            return left ** right
+        if type(node.op) in _AST_BINOPS:
+            return _AST_BINOPS[type(node.op)](left, right)
+    raise ValueError("unsupported expression")
+
+
+def eval_math_or_convert(t, raw=""):
+    """Safely evaluate basic math, percentages, square roots, and unit conversions offline."""
+    low = (raw or t or "").lower().strip()
+    if conv := _convert_units(low):
+        return conv
+    if m := re.search(r"(-?\d+(?:\.\d+)?)\s*(?:%|percent)\s+of\s+(-?\d+(?:\.\d+)?)", low):
+        x, y = float(m.group(1)), float(m.group(2))
+        return f"{_fmt_num(x)} percent of {_fmt_num(y)} is {_fmt_num(x / 100.0 * y)}."
+    if m := re.search(r"(-?\d+(?:\.\d+)?)\s*(?:%|percent)\s+off\s+(-?\d+(?:\.\d+)?)", low):
+        x, y = float(m.group(1)), float(m.group(2))
+        return f"{_fmt_num(x)} percent off {_fmt_num(y)} is {_fmt_num(y * (1.0 - x / 100.0))}."
+    if m := re.search(r"\b(?:the\s+)?square\s+root\s+of\s+(-?\d+(?:\.\d+)?)", low):
+        x = float(m.group(1))
+        if x < 0:
+            return "Cannot take the real square root of a negative number."
+        return f"The square root of {_fmt_num(x)} is {_fmt_num(math.sqrt(x))}."
+    expr = re.sub(r"^(?:calculate|compute|evaluate|solve|what(?:'s| is)|how much is)\s+", "", low)
+    expr = re.sub(r"[?,!.\s]+$", "", expr)
+    for phrase, sym in (("divided by", "/"), ("multiplied by", "*"), ("to the power of", "**"),
+                        ("raised to", "**"), ("plus", "+"), ("minus", "-"), ("times", "*"),
+                        ("over", "/"), ("modulo", "%"), ("mod", "%"), ("^", "**")):
+        expr = expr.replace(phrase, f" {sym} ")
+    expr = re.sub(r"(?<=\d)\s*x\s*(?=\d)", " * ", expr)
+    if not re.fullmatch(r"[\d\s+\-*/%().]+", expr) or not re.search(r"\d\s*(?:\*\*|[+\-*/%])\s*[+\-]?\s*[\d(]", expr):
+        return None
+    try:
+        val = _eval_ast_node(ast.parse(expr, mode="eval"))
+        return f"The answer is {_fmt_num(val)}."
+    except ZeroDivisionError:
+        return "You can't divide by zero."
+    except Exception:
+        return None
 
 
 # ============ the voice-command router ============
@@ -2193,6 +2496,8 @@ def route(t, raw):
     if re.search(r"\b(read|show|what are|what's in)\b.*\bnotes?\b", t) and "open" not in t:
         return read_notes()
     if re.search(r"\bclipboard\b|\bwhat i copied\b", t):
+        if re.search(r"\b(clear|empty)\b", t):
+            return clear_clipboard()
         if re.search(r"\b(summari[sz]e|explain|translate|rewrite|proofread|fix|shorten)\b", t):
             return ai_about_clipboard(raw)
         return (clipboard()[:300] or "Your clipboard is empty.") if re.search(r"\b(read|what)\b", t) else None
@@ -2230,6 +2535,8 @@ def route(t, raw):
     if re.search(r"\b(un)?mute\b", t) and "timer" not in t:
         return volume_mute(False if re.search(r"\bunmute\b", t) else True)
     if re.search(r"\bvolume\b|\blouder\b|\bquieter\b|\bsofter\b|\bturn (it|the (sound|music)) (up|down)\b", t):
+        if re.search(r"\b(what|what's|check|current|how loud|tell me)\b.*\bvolume\b", t):
+            return volume_status()
         n, by = re.search(r"\b(\d{1,3})\b", t), re.search(r"\bby (\d{1,3})\b", t)
         up = re.search(r"\b(up|higher|increase|raise|louder)\b", t)
         down = re.search(r"\b(down|lower|decrease|reduce|quieter|softer)\b", t)
@@ -2239,6 +2546,8 @@ def route(t, raw):
             return volume_set(int(n.group(1)))
         return volume_change("down" if down else "up", int(by.group(1)) if by else 10)
     if re.search(r"\bbrightness\b|\bbrighter\b|\bdimmer\b|\bdim the screen\b", t):
+        if re.search(r"\b(what|what's|check|current|tell me)\b.*\bbrightness\b", t):
+            return brightness_status()
         n = re.search(r"\b(\d{1,3})\b", t)
         if n and not re.search(r"\b(up|down)\b", t):
             return brightness(set_to=int(n.group(1)))
@@ -2283,6 +2592,32 @@ def route(t, raw):
             return WIN_ONLY
         press("alt", "f4")
         return "Closed."
+    for pat, action in (
+        (r"\bmaximi[sz]e\b.*\bwindow\b", "maximize"),
+        (r"\bminimi[sz]e\b.*\bwindow\b", "minimize"),
+        (r"\b(?:snap|move|tile)\b.*\bwindow\b.*\bleft\b", "snap_left"),
+        (r"\b(?:snap|move|tile)\b.*\bwindow\b.*\bright\b", "snap_right"),
+        (r"^(?:switch|next|alt tab) window$|^switch windows$", "switch_window"),
+        (r"^(?:open |create )?(?:a )?new tab$", "new_tab"),
+        (r"^close (?:this |the |current )?tab$", "close_tab"),
+        (r"^(?:reopen|restore) (?:the )?(?:last |closed )?tab$", "reopen_tab"),
+        (r"^(?:next|switch) tab$", "next_tab"),
+        (r"^(?:previous|prev|last) tab$", "prev_tab"),
+        (r"^(?:refresh|reload)(?: (?:this|the|current))?(?: page| tab| window)?$", "refresh"),
+        (r"^find on (?:this )?page$", "find_on_page"),
+        (r"^select all$", "select_all"),
+        (r"^copy(?: that| this| selection)?$", "copy"),
+        (r"^paste(?: that| this| here| clipboard)?$", "paste"),
+        (r"^cut (?:that|this|selection)$", "cut"),
+        (r"^undo (?:typing|last edit|edit|change)$", "undo_edit"),
+        (r"^redo(?: typing| that| last)?$", "redo"),
+        (r"^scroll down$", "scroll_down"),
+        (r"^scroll up$", "scroll_up"),
+        (r"^(?:scroll|go) (?:to )?(?:the )?top$", "scroll_top"),
+        (r"^(?:scroll|go) (?:to )?(?:the )?bottom$", "scroll_bottom"),
+    ):
+        if re.search(pat, t):
+            return window_action(action)
     if m := re.match(r"switch to (.+)", t):
         if IS_WIN and "True" in ps("(New-Object -ComObject WScript.Shell).AppActivate($env:NOVA_ARG)",
                                    NOVA_ARG=m.group(1)).stdout:
@@ -2296,15 +2631,21 @@ def route(t, raw):
         return disk_space()
     if re.search(r"\bwi ?fi\b", t):
         return wifi()
+    if re.search(r"\b(ip address|local ip|my ip)\b", t):
+        return local_ip()
+    if re.search(r"\b(am i online|internet connection|check internet|is the internet)\b", t):
+        return internet_status()
+    if re.search(r"\b(what|which|list|show)\b.*\b(apps|programs|processes)\b.*\b(running|open)\b|\bwhat's running\b", t):
+        return running_apps_text()
     if re.search(r"\b(summari[sz]e|read|explain)\b.*\b(link|url|webpage|web page|article)\b", t):
         m = re.search(r"https?://\S+", raw)
         url = m.group(0) if m else clipboard().strip()
         if not url.startswith(("http://", "https://")):
             return "Copy a link to your clipboard or include the URL, and I'll read it."
         page = read_webpage(url)
-        if not ai_ready():
+        if not ai_ready() or ai_blocked():
             return page[:300]
-        return ask_ai(f"Summarize this webpage concisely in two or three spoken sentences:\n\n{page}")
+        return ask_ai(f"Summarize this webpage concisely in two or three spoken sentences:\n\n{page}") or page[:300]
     if re.search(r"\b(top (?:apps|processes)|using (?:the )?most (?:ram|memory)|slowing down my (?:pc|laptop|computer))\b", t):
         return top_processes()
     if re.search(r"\b(system diagnostics?|pc health|check my pc|memory usage|how much ram|uptime|how long has my (?:pc|laptop|computer) been on)\b", t):
@@ -2342,6 +2683,8 @@ def route(t, raw):
 
     if re.search(r"\bempty\b", t) and re.search(r"\b(recycle|recycling|trash|bin)\b", t):
         return confirm("Empty the Recycle Bin? This permanently deletes everything in it.", empty_recycle_bin)
+    if ans := eval_math_or_convert(t, raw):
+        return ans
     if m := re.match(r"(?:close|quit|exit|stop|kill) (.+)", t):
         r = close_app(m.group(1))
         if r:

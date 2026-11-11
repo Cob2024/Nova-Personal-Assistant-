@@ -38,6 +38,7 @@ class NovaTests(unittest.TestCase):
         assistant.TASKS_FILE = tmp_path / "tasks.json"
         nova_skills._mem = nova_memory.Memory(tmp_path / "memory.db")
         nova_skills.reset_ai()
+        nova_skills.reset_ai_cooldown()
         assistant.setup_skills()
 
     def tearDown(self):
@@ -52,6 +53,7 @@ class NovaTests(unittest.TestCase):
         assistant.TASKS_FILE = self._orig_tasks
         nova_skills._mem = self._orig_mem
         nova_skills.reset_ai()
+        nova_skills.reset_ai_cooldown()
         self.tmp.cleanup()
 
     def test_backwards_compat_anthropic_config(self):
@@ -583,6 +585,124 @@ class NovaTests(unittest.TestCase):
              }):
             ans = assistant.handle("who is Ada Lovelace")
         self.assertEqual(ans, "Ada Lovelace was an English mathematician. She worked on the Analytical Engine.")
+
+    def test_voice_mishearing_filler_wake_and_cancel(self):
+        self.assertEqual(assistant.find_wake("ok hey can you nova open notepad"), "open notepad")
+        self.assertIsNone(assistant.find_wake("one two three four five nova open notepad"))
+
+        with mock.patch.object(nova_skills, "launch_any", return_value=True) as lm:
+            r1 = assistant.handle("Open WhatsApp. Hello.")
+        self.assertEqual(r1, "Opening whatsapp.")
+        lm.assert_called_once_with("whatsapp:")
+
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch("subprocess.run", return_value=SimpleNamespace(returncode=0)) as sr:
+            r2 = assistant.handle("Close what's up.")
+        self.assertEqual(r2, "Closing what's up.")
+        self.assertEqual(sr.call_args.args[0], ["taskkill", "/IM", "WhatsApp.exe"])
+
+        with mock.patch.object(nova_skills, "media", return_value="Going back.") as mm:
+            r3 = assistant.handle("And go back.")
+        self.assertEqual(r3, "Going back.")
+        mm.assert_called_once_with("prev")
+
+        assistant.ask("Which one?", lambda x: "picked " + x)
+        self.assertEqual(assistant.handle("You forget about that one."), "Okay, cancelled.")
+
+    def test_mic_vad_gate_and_ambient_cap(self):
+        import numpy as np
+        mic = assistant.Mic.__new__(assistant.Mic)
+        mic.np = np
+        mic.sr = 16000
+        mic.ambient = 0.014
+        mic._vad = True
+        mic.model = mock.Mock()
+        mic.voice_lock = None
+
+        loud_chunk = np.full((1600, 1), 0.08, dtype=np.float32)
+        noise_chunk = np.full((1600, 1), 0.03, dtype=np.float32)
+        silent_chunk = np.zeros((1600, 1), dtype=np.float32)
+
+        class FakeStream:
+            read_available = 0
+
+            def __init__(self, items):
+                self.items = list(items)
+
+            def read(self, n):
+                return self.items.pop(0)
+
+        mic.stream = FakeStream([(noise_chunk, False)] * 3 + [(loud_chunk, False)] * 5 + [(silent_chunk, False)] * 10)
+        with mock.patch("faster_whisper.vad.get_speech_timestamps", return_value=[]) as gv:
+            out = mic.listen(wait=5)
+        self.assertEqual(out, "")
+        self.assertLessEqual(mic.ambient, 0.015)
+        gv.assert_called_once()
+        mic.model.transcribe.assert_not_called()
+
+    def test_ai_billing_cooldown_and_offline_fallback(self):
+        nova_skills.CONFIG_FILE.write_text(json.dumps({
+            "provider": "ollama_cloud", "api_key": "ol-key", "model": "deepseek-v4.1-flash"
+        }))
+        with mock.patch.object(nova_skills, "_http_json", side_effect=RuntimeError("HTTP 402: credits needed")) as m:
+            first = assistant.handle("explain quantum entanglement")
+        self.assertIn("credits", first.lower())
+        self.assertTrue(nova_skills.ai_blocked())
+        self.assertEqual(m.call_count, 1)
+
+        with mock.patch.object(nova_skills, "_http_json", side_effect=[{"extract": "Python is a language."}]) as m2:
+            fact = assistant.handle("who is Python")
+        self.assertEqual(fact, "Python is a language.")
+        self.assertEqual(m2.call_count, 1)
+
+        with mock.patch.object(nova_skills, "_http_json", side_effect=AssertionError("AI should be on cooldown")):
+            silent = assistant.handle("this is a long random conversation phrase with more than ten words right now")
+        self.assertIsNone(silent)
+
+    def test_window_shortcuts_status_queries_and_clear_clipboard(self):
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch.object(nova_skills, "press") as kp:
+            self.assertEqual(assistant.handle("maximize window"), "Maximized window.")
+            self.assertEqual(assistant.handle("snap window left"), "Snapped window left.")
+            self.assertEqual(assistant.handle("new tab"), "Opened a new tab.")
+            self.assertEqual(assistant.handle("close tab"), "Closed the tab.")
+            self.assertEqual(assistant.handle("undo typing"), "Undid the last edit.")
+            self.assertEqual(assistant.handle("scroll down"), "Scrolled down.")
+        self.assertEqual(
+            [c.args for c in kp.call_args_list],
+            [("win", "up_arrow"), ("win", "left_arrow"), ("ctrl", "t"), ("ctrl", "w"), ("ctrl", "z"), ("pgdn",)],
+        )
+
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch.object(nova_skills, "_audio_cmd", return_value=(42, False)) as ac:
+            self.assertEqual(assistant.handle("what's the volume"), "Volume is at 42 percent.")
+        ac.assert_called_once_with("get", 0)
+
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch.object(nova_skills, "ps", return_value=SimpleNamespace(stdout="75\n")) as psm:
+            self.assertEqual(assistant.handle("what's the brightness"), "Brightness is at 75 percent.")
+            self.assertEqual(assistant.handle("clear clipboard"), "Clipboard cleared.")
+        self.assertEqual(psm.call_count, 2)
+
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch.object(nova_skills, "_running_procs", return_value=[
+                 ("svchost.exe", "1", 90000), ("chrome.exe", "2", 50000), ("Code.exe", "3", 30000)
+             ]):
+            apps = assistant.handle("what apps are running")
+        self.assertIn("chrome", apps.lower())
+        self.assertIn("code", apps.lower())
+        self.assertNotIn("svchost", apps.lower())
+        self.assertIn("ip address is", assistant.handle("what's my ip address").lower())
+
+    def test_offline_math_and_unit_conversions(self):
+        self.assertEqual(assistant.handle("what is 15 percent of 240"), "15 percent of 240 is 36.")
+        self.assertEqual(assistant.handle("20% off 80"), "20 percent off 80 is 64.")
+        self.assertEqual(assistant.handle("what is the square root of 144"), "The square root of 144 is 12.")
+        self.assertEqual(assistant.handle("what is (12 + 8) * 3"), "The answer is 60.")
+        self.assertEqual(assistant.handle("12 times 15"), "The answer is 180.")
+        self.assertEqual(assistant.handle("convert 100 km to miles"), "100 kilometers is 62.1371 miles.")
+        self.assertEqual(assistant.handle("72 fahrenheit to celsius"), "72 degrees Fahrenheit is 22.2222 degrees Celsius.")
+        self.assertEqual(assistant.handle("64 gigabytes in megabytes"), "64 gigabytes is 65536 megabytes.")
 
 
 if __name__ == "__main__":

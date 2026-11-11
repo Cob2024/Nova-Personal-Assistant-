@@ -218,10 +218,28 @@ class Mic:
         self.stream = sd.InputStream(samplerate=self.sr, channels=1,
                                      dtype="float32", device=MIC_DEVICE)
         self.stream.start()
-        self.ambient = self._level(self.stream.read(self.sr)[0])   # room noise
+        self.ambient = min(0.015, self._level(self.stream.read(self.sr)[0]))   # room noise
+        try:
+            from faster_whisper.vad import get_vad_model
+            get_vad_model()
+            self._vad = True
+        except Exception:
+            self._vad = False
 
     def _level(self, block):
         return float(self.np.abs(block).mean())
+
+    def _has_speech(self, audio):
+        """Fast pre-check with Silero VAD to skip clicks and non-speech bursts before Whisper."""
+        if not getattr(self, "_vad", False):
+            return True
+        try:
+            from faster_whisper.vad import VadOptions, get_speech_timestamps
+            return bool(get_speech_timestamps(
+                audio, VadOptions(threshold=0.45, min_speech_duration_ms=200), sampling_rate=self.sr,
+            ))
+        except Exception:
+            return True
 
     def recalibrate(self):
         self.ambient = self._level(self.stream.read(self.sr)[0])
@@ -253,17 +271,17 @@ class Mic:
             block, _ = self.stream.read(self.sr // 10)
             level = self._level(block)
             UI.level = level
-            if level > max(0.004, self.ambient * 3.5) * SENSITIVITY:
+            if level > max(0.003, min(self.ambient * 3.0, 0.025)) * SENSITIVITY:
                 if not started:
                     chunks, started, t_start = list(pre), True, time.time()
                 quiet, loud = 0, loud + 1
             else:
                 quiet += 1
-                if not started:              # keep tracking background noise
-                    self.ambient = 0.95 * self.ambient + 0.05 * level
+                if not started:              # keep tracking background noise (capped)
+                    self.ambient = min(0.015, 0.95 * self.ambient + 0.05 * level)
             if started:
                 chunks.append(block)
-                if quiet > 10 or time.time() - t_start > max_seconds:
+                if quiet > 7 or time.time() - t_start > max_seconds:
                     break
             else:
                 pre.append(block)
@@ -273,6 +291,8 @@ class Mic:
             return ""
         audio = np.concatenate(chunks).flatten()
         if len(audio) < int(self.sr * 0.25) or float(np.max(np.abs(audio))) < 0.008:
+            return ""
+        if not self._has_speech(audio):
             return ""
         if self.voice_lock and self.voice_lock.ready and voice_mod:
             speech = voice_mod.trim_silence(audio, self.sr)
@@ -442,7 +462,7 @@ def start_organize(folder):
                lambda x: run_moves(moves) if is_yes(x) else "No problem, I won't touch anything.")
 
 
-FILLER = re.compile(r"^(?:(?:hey |ok |okay )?(?:please|can you|could you|would you|will you|"
+FILLER = re.compile(r"^(?:(?:and|then|so|also|now)\s+|(?:hey |ok |okay )?(?:please|can you|could you|would you|will you|"
                     r"i want you to|i'd like you to|i would like you to|i need you to|"
                     r"go ahead and|i want to)\s+)+")
 DONE_WORDS = r"\b(done|complete|completed|finish|finished|check off|tick off|cross off)\b"
@@ -465,7 +485,8 @@ def handle(raw, on_sentence=None, stop_event=None):
         raise SystemExit("Okay, shutting down. Goodbye!")
     if awaiting:
         step, awaiting = awaiting, None
-        if re.search(r"\b(cancel|never ?mind|forget it)\b", t):
+        if re.search(r"\b(cancel|never ?mind|forget(?: about)?(?: it| that| this| one)?|skip)\b", t) or \
+                re.fullmatch(r"(?:no|nope|stop|leave it)", t):
             return "Okay, cancelled."
         return step(t)
     t = re.sub(r"\s+please$", "", FILLER.sub("", t))
@@ -535,7 +556,8 @@ def handle(raw, on_sentence=None, stop_event=None):
 
     global _ai_hinted
     if skills and 2 <= len(t.split()) <= 200:
-        if (not skills.ai_ready()) and re.match(r"(?:who|what)\s+(?:is|was|are)\s+|(?:define|tell me about)\s+", t):
+        ai_down = not skills.ai_ready() or (hasattr(skills, "ai_blocked") and skills.ai_blocked())
+        if ai_down and re.match(r"(?:who|what)\s+(?:is|was|are)\s+|(?:define|tell me about)\s+", t):
             fact = skills.quick_lookup(t)
             if fact:
                 return fact
@@ -553,9 +575,9 @@ def handle(raw, on_sentence=None, stop_event=None):
 
 def find_wake(heard):
     """Text after the name ('' if nothing follows), or None if Nova wasn't called.
-    The name must be within the first 3 words, so it ignores 'nova' mid-sentence."""
+    The name must be within the first 5 words, so it ignores 'nova' mid-sentence."""
     words = heard.split()
-    for i, w in enumerate(words[:3]):
+    for i, w in enumerate(words[:5]):
         if " ".join(words[i:i + 2]) in WAKE_ALIASES:
             return " ".join(words[i + 2:])
         if w in WAKE_ALIASES or SequenceMatcher(None, w, "nova").ratio() >= 0.8:
