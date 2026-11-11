@@ -1,0 +1,32 @@
+# Secrets & environment variables
+.env
+.env.*
+!.env.example
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local runtime state, databases, logs, and credentials
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+*.log
+config.json
+voiceprint.json
+tasks.json
+reminders.json
+last_move.json
+.laptop_assistant/
+
+# Editor & OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
