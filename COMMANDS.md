@@ -189,8 +189,11 @@ Optional **Internet** commands fetch live data (weather, Wikipedia summaries, we
 
 ---
 
-## 10. Memory, Web & Optional AI Features
+## 10. Identity, Memory, Web & Optional AI Features
 
+- **Your Name & Identity** (stored locally in `~/.laptop_assistant/memory.db`, works offline):
+  - `"My name is Cobby"` / `"Call me Cobby"` / `"Remember that my name is Cobby"`
+  - `"What's my name?"` / `"Who am I?"` / `"Do you know my name?"` *(Nova also greets you by name on startup, wake, `"hello"`, `"good morning"`, and `"daily briefing"`)*
 - **Persistent local memory** (`~/.laptop_assistant/memory.db`, works offline):
   - `"Remember that my favorite coffee is espresso"` / `"Remember my Wi-Fi password is ..."`
   - `"What do you remember about coffee?"`

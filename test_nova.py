@@ -704,6 +704,22 @@ class NovaTests(unittest.TestCase):
         self.assertEqual(assistant.handle("72 fahrenheit to celsius"), "72 degrees Fahrenheit is 22.2222 degrees Celsius.")
         self.assertEqual(assistant.handle("64 gigabytes in megabytes"), "64 gigabytes is 65536 megabytes.")
 
+    def test_user_name_persistence_and_personalization(self):
+        self.assertIn("haven't told me", assistant.handle("what's my name").lower())
+        res = assistant.handle("my name is COBBY")
+        self.assertEqual(res, "Got it, Cobby. I'll remember your name.")
+        self.assertEqual(assistant.handle("what's my name"), "Your name is Cobby.")
+        self.assertEqual(assistant.handle("who am i"), "Your name is Cobby.")
+        self.assertIn("Cobby", assistant.handle("hello"))
+        self.assertIn("Cobby", assistant._wake_reply())
+        self.assertIn("The user's name is Cobby.", nova_skills._system())
+        with mock.patch.object(nova_skills, "weather", return_value=""):
+            self.assertIn("Cobby", assistant.handle("good morning"))
+        # Negative guard: "call me back" must not overwrite the saved user name
+        with mock.patch.object(nova_skills, "ask_ai", return_value=None):
+            assistant.handle("call me back")
+        self.assertEqual(nova_skills.get_user_name(), "Cobby")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

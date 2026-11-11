@@ -468,6 +468,17 @@ FILLER = re.compile(r"^(?:(?:and|then|so|also|now)\s+|(?:hey |ok |okay )?(?:plea
 DONE_WORDS = r"\b(done|complete|completed|finish|finished|check off|tick off|cross off)\b"
 
 
+def _user_name():
+    return skills.get_user_name() if skills and hasattr(skills, "get_user_name") else ""
+
+
+def _wake_reply():
+    uname = _user_name()
+    if uname:
+        return random.choice([f"Yes, {uname}?", f"I'm listening, {uname}.", f"Hi {uname}! What do you need?"])
+    return random.choice(["Yes?", "I'm listening.", "Hi! What do you need?"])
+
+
 def new_task(text):
     text = re.sub(r"^(to|that|about)\s+", "", text.strip())
     return add_task(text) if text else ask("Sure. What should the task say?", new_task)
@@ -492,7 +503,10 @@ def handle(raw, on_sentence=None, stop_event=None):
     t = re.sub(r"\s+please$", "", FILLER.sub("", t))
     if len(t.split()) <= 5 and re.search(
             r"\b(thanks|thank you|that's all|that is all|never ?mind|goodbye|bye)\b", t):
-        raise EndSession(random.choice(["You're welcome!", "Anytime.", "Happy to help."]))
+        uname = _user_name()
+        farewells = [f"You're welcome, {uname}!", f"Anytime, {uname}.", "Happy to help."] if uname \
+            else ["You're welcome!", "Anytime.", "Happy to help."]
+        raise EndSession(random.choice(farewells))
 
     if skills:
         reply = skills.route(t, raw)
@@ -503,6 +517,9 @@ def handle(raw, on_sentence=None, stop_event=None):
     if re.search(r"\b(your name|who are you)\b", t):
         return "I'm Nova, your assistant. I live on your laptop and help with your files and tasks."
     if len(t.split()) <= 3 and re.match(r"(hello|hi|hey|good (morning|afternoon|evening))\b", t):
+        uname = _user_name()
+        if uname:
+            return random.choice([f"Hi {uname}! What can I do for you?", f"Hello {uname}! How can I help?"])
         return random.choice(["Hi there! What can I do for you?", "Hello! How can I help?"])
     if re.search(r"how are you", t):
         return "I'm doing great, thanks for asking. What can I help with?"
@@ -1565,7 +1582,12 @@ def run_voice():
                 print(f"   (voice lock disabled: {vl.error})")
     global _mic
     mic = _mic = Mic(voice_lock=voice_lock)
-    say("Nova is online." if background else f"I'm ready. Just say {NAME} when you need me.")
+    uname = _user_name()
+    if background:
+        say(f"Nova is online. Hello {uname}." if uname else "Nova is online.")
+    else:
+        say(f"I'm ready, {uname}. Just say {NAME} when you need me." if uname
+            else f"I'm ready. Just say {NAME} when you need me.")
     if not skills:
         say("My abilities file is missing, so I can only do the basics. Put nova skills dot pie next to my main file.")
     UI.post("hide")
@@ -1574,7 +1596,7 @@ def run_voice():
         if _wake_event.is_set():
             _wake_event.clear()
             UI.post("wake")
-            say(random.choice(["Yes?", "I'm listening.", "Hi! What do you need?"]))
+            say(_wake_reply())
             session(mic)
             if skills:
                 skills.reset_ai()
@@ -1593,7 +1615,7 @@ def run_voice():
                 UI.post("hide")
                 continue
         else:
-            say(random.choice(["Yes?", "I'm listening.", "Hi! What do you need?"]))
+            say(_wake_reply())
         session(mic)
         if skills:
             skills.reset_ai()

@@ -1154,7 +1154,9 @@ def read_notes(n=3):
 def briefing():
     now = datetime.now()
     part = "morning" if now.hour < 12 else "afternoon" if now.hour < 18 else "evening"
-    out = [f"Good {part}. It's {now.strftime('%I:%M %p').lstrip('0')} on {now:%A}, {now:%B} {now.day}."]
+    uname = get_user_name()
+    greet = f"Good {part}, {uname}." if uname else f"Good {part}."
+    out = [f"{greet} It's {now.strftime('%I:%M %p').lstrip('0')} on {now:%A}, {now:%B} {now.day}."]
     tasks = [x["text"] for x in ctx["load_tasks"]() if not x["done"]] if "load_tasks" in ctx else []
     if tasks:
         out.append(f"You have {len(tasks)} open task{'s' * (len(tasks) != 1)}, including {tasks[0]}.")
@@ -1411,6 +1413,41 @@ def _memory():
     if _mem is None and mem_mod:
         _mem = mem_mod.Memory()
     return _mem
+
+
+def _format_person_name(name):
+    cleaned = re.sub(r"[?.!,]+$", "", " ".join(str(name).split())).strip()
+    cleaned = re.sub(r"(?:\s+(?:please|thanks|thank you))+$", "", cleaned, flags=re.I).strip()
+    if not cleaned:
+        return ""
+    return " ".join(w if (any(c.isupper() for c in w) and any(c.islower() for c in w)) else w.title()
+                    for w in cleaned.split())
+
+
+def get_user_name():
+    """Return the user's saved name from persistent memory (or config), if known."""
+    m = _memory()
+    if m:
+        for key in ("user_name", "name", "first_name"):
+            row = next((f for f in m.all_facts(limit=30) if f["key"] == key and f["value"].strip()), None)
+            if row:
+                return row["value"].strip()
+    return str(_config().get("user_name") or "").strip()
+
+
+def set_user_name(name):
+    """Save the user's preferred name into persistent memory (or config fallback)."""
+    clean_name = _format_person_name(name)
+    if not clean_name:
+        return "What name should I call you?"
+    m = _memory()
+    if m:
+        m.remember("user_name", clean_name, category="profile")
+    else:
+        cfg = _config()
+        cfg["user_name"] = clean_name
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return f"Got it, {clean_name}. I'll remember your name."
 
 
 def active_window():
@@ -1683,6 +1720,9 @@ def _system():
     win = active_window()
     if win:
         base += f"\nActive window: {win.get('app') or 'unknown'} — {win.get('title') or ''}."
+    uname = get_user_name()
+    if uname:
+        base += f"\nThe user's name is {uname}."
     m = _memory()
     if m:
         mem_ctx = m.context_summary()
@@ -2456,7 +2496,17 @@ def route(t, raw):
                 cal_mod.add_event(title, dt)
                 return f"Added {title} to your calendar {clock_text(dt)}."
 
-    # --- memory, screen & active window ---
+    # --- user identity, memory, screen & active window ---
+    if re.search(r"\b(?:what(?:'s| is) my name|who am i|do you know my name)\b", t):
+        uname = get_user_name()
+        return f"Your name is {uname}." if uname else "You haven't told me your name yet. Just say my name is, followed by your name."
+    if m := (re.match(r"remember (?:that )?my name is ([a-z][a-z'\- ]{1,30})$", t)
+             or re.match(r"(?:actually |no )?my name is ([a-z][a-z'\- ]{1,30})$", t)
+             or re.match(r"call me ([a-z][a-z'\- ]{1,25})$", t)):
+        cand = m.group(1).strip()
+        bad = {"back", "later", "soon", "when", "if", "not", "sure", "okay", "fine", "tired", "here", "ready"}
+        if cand.split()[0] not in bad and not re.search(r"\b(?:is|are|was|the|not|working)\b", cand):
+            return set_user_name(cand)
     if re.search(r"\b(what's|what is|read|look at|see|check|describe|explain)\b.*\b(on my screen|my screen|this screen)\b", t):
         return inspect_screen(raw)
     if re.search(r"\b(what window|which window|what app|which app|active window)\b", t):
