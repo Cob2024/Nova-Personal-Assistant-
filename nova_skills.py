@@ -427,7 +427,85 @@ def _lookup(table, key, cutoff=0.8):
     return table[m[0]] if m else None
 
 
+def _spotify_exe():
+    if not IS_WIN:
+        return None
+    appdata = os.environ.get("APPDATA", "")
+    candidates = [
+        Path(appdata) / "Spotify" / "Spotify.exe" if appdata else None,
+        HOME / "AppData" / "Roaming" / "Spotify" / "Spotify.exe",
+    ]
+    for p in candidates:
+        if p and p.exists():
+            return p
+    for name, target in start_apps():
+        if "spotify" in name.lower() and target.lower().endswith(".exe") and Path(target).exists():
+            return Path(target)
+    return None
+
+
+def _focus_window(hint):
+    """Bring an already-open or minimized window matching `hint` to the foreground on Windows."""
+    needle = re.sub(r"\.exe$", "", (hint or "").strip().lower())
+    if not IS_WIN or not needle:
+        return False
+    matched_hwnds = []
+    try:
+        u = ctypes.windll.user32
+        k = ctypes.windll.kernel32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def cb(hwnd, _lp):
+            if not u.IsWindowVisible(hwnd):
+                return True
+            n = u.GetWindowTextLengthW(hwnd)
+            title = ""
+            if n > 0:
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(hwnd, buf, n + 1)
+                title = buf.value.strip()
+            pid = ctypes.c_ulong(0)
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            exe_stem = ""
+            if pid.value:
+                proc = k.OpenProcess(0x1000, False, pid.value)
+                if proc:
+                    try:
+                        ebuf = ctypes.create_unicode_buffer(512)
+                        sz = ctypes.c_ulong(512)
+                        if k.QueryFullProcessImageNameW(proc, 0, ebuf, ctypes.byref(sz)):
+                            exe_stem = Path(ebuf.value).stem.lower()
+                    finally:
+                        k.CloseHandle(proc)
+            if title and (needle in title.lower() or needle in exe_stem):
+                matched_hwnds.append(hwnd)
+                return False
+            return True
+
+        u.EnumWindows(WNDENUMPROC(cb), 0)
+        if matched_hwnds:
+            hwnd = matched_hwnds[0]
+            if u.IsIconic(hwnd):
+                u.ShowWindowAsync(hwnd, 9)                 # SW_RESTORE
+            else:
+                u.ShowWindowAsync(hwnd, 5)                 # SW_SHOW
+            u.SetForegroundWindow(hwnd)
+            return True
+    except Exception:
+        pass
+    try:
+        return "True" in ps("(New-Object -ComObject WScript.Shell).AppActivate($env:NOVA_ARG)", NOVA_ARG=hint).stdout
+    except Exception:
+        return False
+
+
 def launch_any(target):
+    if target == "spotify:":
+        exe = _spotify_exe()
+        ok = launch(str(exe)) if exe else launch(target)
+        if ok:
+            threading.Thread(target=lambda: (time.sleep(0.9), _focus_window("spotify")), daemon=True).start()
+        return ok
     if target.startswith("shell:"):                    # explorer opens shell folders (it reports exit 1 even on success)
         try:
             subprocess.Popen(["explorer.exe", target], creationflags=NOWIN)
@@ -438,32 +516,137 @@ def launch_any(target):
 
 
 _start = None
+_APP_NOISE = ("uninstall", "debuggable", "documentation", "manual", "help", "readme", "release notes")
+
+
+def _discover_installed_apps():
+    """Collect installed Windows apps across Start Menu AppIDs, Registry App Paths, and shortcuts."""
+    seen = {}
+
+    def add(name, target):
+        clean_n = " ".join(str(name).split()).strip()
+        tgt = str(target).strip()
+        norm_k = " ".join(re.findall(r"[a-z0-9]+", clean_n.lower()))
+        if not clean_n or not tgt or not norm_k:
+            return
+        seen.setdefault(norm_k, (clean_n, tgt))
+
+    if not IS_WIN:
+        return []
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-StartApps | ForEach-Object { $_.Name + '|' + $_.AppID }"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, stdin=subprocess.DEVNULL, creationflags=NOWIN,
+        )
+        for line in r.stdout.splitlines():
+            if "|" in line:
+                n, tid = line.split("|", 1)
+                add(n, tid)
+    except Exception as err:
+        print("start menu lookup failed:", err)
+    try:
+        import winreg
+        reg_sub = r"Software\Microsoft\Windows\CurrentVersion\App Paths"
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for sub in (reg_sub, r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"):
+                try:
+                    with winreg.OpenKey(hive, sub) as root:
+                        i = 0
+                        while True:
+                            try:
+                                app_key = winreg.EnumKey(root, i)
+                                i += 1
+                                with winreg.OpenKey(root, app_key) as ak:
+                                    exe_val, _ = winreg.QueryValueEx(ak, "")
+                                    exe_path = str(exe_val).strip().strip('"')
+                                    if exe_path and Path(exe_path).exists():
+                                        label = re.sub(r"\.exe$", "", app_key, flags=re.I)
+                                        add(label.replace("-", " ").title(), exe_path)
+                            except OSError:
+                                break
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    shortcut_roots = [
+        Path(os.environ.get("USERPROFILE", str(HOME))) / "Desktop",
+        Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "Desktop",
+        Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    ]
+    for root in shortcut_roots:
+        if not root.exists():
+            continue
+        try:
+            for lnk in root.rglob("*.lnk"):
+                low = lnk.stem.lower()
+                if any(bad in low for bad in _APP_NOISE):
+                    continue
+                add(lnk.stem, str(lnk))
+        except OSError:
+            pass
+    return sorted(seen.values(), key=lambda x: x[0].lower())
 
 
 def start_apps():
-    """Every app in the Start menu, as (name, id). Cached after the first lookup."""
+    """Every installed app found on this laptop, as (name, target). Cached after first lookup."""
     global _start
     if _start is None:
-        _start = []
-        if IS_WIN:
-            try:
-                out = ps("Get-StartApps | ForEach-Object { $_.Name + '|' + $_.AppID }").stdout
-                _start = [tuple(l.split("|", 1)) for l in out.splitlines() if "|" in l]
-            except Exception as err:
-                print("start menu lookup failed:", err)
+        _start = _discover_installed_apps()
     return _start
+
+
+def installed_apps(refresh=False):
+    global _start
+    if refresh:
+        _start = None
+    return start_apps()
+
+
+def list_installed_apps_text(query="", limit=15):
+    """Describe or search installed applications visible to Nova on this laptop."""
+    if not IS_WIN:
+        return WIN_ONLY
+    apps = installed_apps()
+    if not apps:
+        return "I couldn't read any installed apps on this laptop."
+    q = re.sub(r"\b(?:the|a|an|app|application|program|software|called|named|installed|on|my|laptop|pc)\b", " ",
+               (query or "").lower())
+    q = " ".join(q.split())
+    clean_list = [n for n, _ in apps if not any(w in n.lower() for w in _APP_NOISE)]
+    pool = clean_list or [n for n, _ in apps]
+    if q:
+        hits = [n for n in pool if q in n.lower()]
+        if not hits:
+            hits = difflib.get_close_matches(q, pool, n=5, cutoff=0.6)
+        if not hits:
+            return f"I checked {len(apps)} installed apps, and I didn't find anything matching {q}."
+        return f"Installed apps matching {q}: " + ", ".join(hits[:limit]) + "."
+    sample = pool[:min(limit, 12)]
+    return f"I can see {len(apps)} installed apps on your laptop, including {', '.join(sample)}."
 
 
 def open_start_app(key):
     apps = {n.lower(): (n, i) for n, i in start_apps()}
-    hit = apps.get(key) or next((v for n, v in apps.items() if n.startswith(key) or key in n.split()), None)
+    hit = (apps.get(key)
+           or next((v for n, v in apps.items() if n.startswith(key) or key in re.findall(r"[a-z0-9]+", n)), None)
+           or (next((v for n, v in apps.items() if key in n), None) if len(key) >= 4 else None))
     if not hit:
-        m = difflib.get_close_matches(key, list(apps), n=1, cutoff=0.8)
+        m = difflib.get_close_matches(key, list(apps), n=1, cutoff=0.7)
         hit = apps[m[0]] if m else None
     if not hit:
         return None
-    subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + hit[1]], creationflags=NOWIN)
-    return hit[0]
+    label, target = hit
+    if (":" in target and not target.endswith(":") and Path(target).exists()) or (
+            target.lower().endswith((".exe", ".lnk", ".bat", ".cmd")) and Path(target).exists()):
+        if not launch(target):
+            return None
+    else:
+        subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + target], creationflags=NOWIN)
+    threading.Thread(target=lambda: (time.sleep(0.9), _focus_window(label)), daemon=True).start()
+    return label
 
 
 def _running_procs():
@@ -549,13 +732,48 @@ def empty_recycle_bin():
     return "Done. The Recycle Bin is empty."
 
 
-def launch(target):
+def launch(target, arg=""):
     if not IS_WIN:
         return False
     try:
+        if arg:
+            return ps("Start-Process $env:NOVA_ARG -ArgumentList $env:NOVA_ARG2 -ErrorAction Stop",
+                      NOVA_ARG=target, NOVA_ARG2=arg).returncode == 0
         return ps("Start-Process $env:NOVA_ARG -ErrorAction Stop", NOVA_ARG=target).returncode == 0
     except Exception:
         return False
+
+
+def play_spotify(query=""):
+    """Open Spotify visibly on the laptop and play music or search for a requested song/artist."""
+    q = re.sub(r"^(?:the song|a song|some music|music|song|track|for)\s+", "", (query or "").strip(), flags=re.I).strip()
+    generic = {"", "spotify", "music", "a song", "song", "some music", "songs", "tracks",
+               "something", "anything", "my music", "my playlist", "liked songs"}
+    exe = _spotify_exe()
+    installed = bool(exe or (IS_WIN and any("spotify" in n.lower() for n, _ in start_apps())))
+    if not installed:
+        url = "https://open.spotify.com/" if q.lower() in generic else "https://open.spotify.com/search/" + urllib.parse.quote(q)
+        webbrowser.open(url)
+        return "Opening Spotify in your browser." if q.lower() in generic else f"Searching Spotify in your browser for {q}."
+    was_running = any("spotify" in p[0].lower() for p in _running_procs())
+    if q.lower() in generic:
+        ok = launch(str(exe)) if exe else launch("spotify:")
+        if ok:
+            def _play_after_open():
+                time.sleep(0.3 if was_running else 2.2)
+                _focus_window("spotify")
+                time.sleep(0.15)
+                press("play")
+            threading.Thread(target=_play_after_open, daemon=True).start()
+            return "Playing music on Spotify."
+        return "I couldn't open Spotify."
+    uri = "spotify:search:" + urllib.parse.quote(q)
+    ok = launch(str(exe), f"--uri={uri}") if exe else launch(uri)
+    if ok:
+        threading.Thread(target=lambda: (time.sleep(0.9), _focus_window("spotify")), daemon=True).start()
+        return f"Opening {q} in Spotify."
+    webbrowser.open("https://open.spotify.com/search/" + urllib.parse.quote(q))
+    return f"Searching Spotify for {q}."
 
 
 def folder_from(text, exact=False):
@@ -1034,16 +1252,27 @@ def newest(folder):
 
 
 def open_thing(name, interactive=True):
-    key = re.sub(r"^(?:(?:the|my|up|a|that)\s+)+", "", name.lower().strip())
-    key = re.sub(r"(?:\s+(?:app|application|website|site|page|folder|please|hello|hi|hey|now|thanks|thank you))+$",
-                 "", key).strip()
+    key = name.lower().strip()
+    for _ in range(3):
+        nxt = re.sub(r"^(?:(?:the|my|up|a|that|app|application|program|software)\s+)+", "", key)
+        nxt = re.sub(
+            r"(?:\s+(?:on\s+(?:my|the|this)\s+(?:laptop|pc|computer)|on\s+(?:laptop|pc)|"
+            r"app|application|program|software|browser|website|site|page|folder|please|hello|hi|hey|now|thanks|thank you))+$",
+            "", nxt,
+        ).strip()
+        if nxt == key:
+            break
+        key = nxt
     if not key:
         return None
     if key in ("tasks", "task", "to do list", "todo list", "to do"):
         return None
     for table in (APPS, SHELL):                                    # apps and special Windows places
-        if (target := _lookup(table, key, 0.8)):
-            return f"Opening {key}." if launch_any(target) else f"I couldn't open {key}."
+        if (target := _lookup(table, key, 0.7)):
+            ok = launch_any(target)
+            if ok and IS_WIN and target != "spotify:":
+                threading.Thread(target=lambda k=key: (time.sleep(0.7), _focus_window(k)), daemon=True).start()
+            return f"Opening {key}." if ok else f"I couldn't open {key}."
     base = re.sub(r"\s+settings?$", "", key)
     if base != key or key in SETTINGS:                             # "wifi settings", "bluetooth"
         if (target := _lookup(SETTINGS, base, 0.75)):
@@ -1789,6 +2018,9 @@ def inspect_screen(question="Describe what is currently on my screen and help wi
 
 TOOLS = [
     _tool("open_app_or_website", "Open an app, folder, website or file by name.", {"name": "string"}),
+    _tool("list_installed_apps", "List or search applications installed on the user's Windows laptop.", {"query?": "string"}),
+    _tool("list_running_apps", "List applications currently running on the laptop.", {}),
+    _tool("play_on_spotify", "Open Spotify and play music or search for a song/artist on Spotify.", {"query?": "string"}),
     _tool("web_search", "Search the web in the user's browser.", {"query": "string"}),
     _tool("set_volume", "Set the speaker volume from 0 to 100.", {"percent": "number"}),
     _tool("media_control", "Control media: play, pause, next or previous.", {"action": "string"}),
@@ -1830,6 +2062,9 @@ TOOLS = [
 ]
 FUNCS = {
     "open_app_or_website": lambda name: open_thing(name, interactive=False) or "Nothing to open.",
+    "list_installed_apps": lambda query="": list_installed_apps_text(query),
+    "list_running_apps": lambda: running_apps_text(),
+    "play_on_spotify": lambda query="": play_spotify(query),
     "web_search": web_search,
     "set_volume": lambda percent: volume_set(percent),
     "media_control": media,
@@ -1876,6 +2111,8 @@ def _system():
     base = (f"You are {get_assistant_name()}, a sharp, Jarvis-like personal AI assistant living on the user's Windows laptop. "
             "Your replies are spoken aloud: answer in one to three short sentences, in plain words, "
             "with no markdown, lists, links or emojis. Use the tools to act on the laptop when asked, "
+            "use list_installed_apps to check what applications are installed before claiming an app is missing, "
+            "use open_app_or_website to open apps and play_on_spotify to play songs on Spotify, "
             "remember personal facts/preferences the user shares via remember_fact, and confirm briefly what you did. "
             "If a request is unclear, ask one short question. If you don't know something, say so. "
             "You cannot delete files or change system power. "
@@ -2804,11 +3041,12 @@ def route(t, raw):
         return media("next")
     if re.fullmatch(r"(previous|go back|last)( song| track| video)?", t):
         return media("prev")
+    if re.fullmatch(r"play\s+(?:on\s+)?spotify", t):
+        return play_spotify("")
     if m := re.match(r"play (.+?)(?: on (youtube|spotify))?$", t):
         what, where = m.group(1), m.group(2) or "youtube"
         if where == "spotify":
-            webbrowser.open("spotify:search:" + urllib.parse.quote(what))
-            return f"Searching Spotify for {what}."
+            return play_spotify(what)
         webbrowser.open("https://www.youtube.com/results?search_query=" + urllib.parse.quote(what))
         return f"Searching YouTube for {what}."
 
@@ -2864,12 +3102,24 @@ def route(t, raw):
         if re.search(pat, t):
             return window_action(action)
     if m := re.match(r"switch to (.+)", t):
-        if IS_WIN and "True" in ps("(New-Object -ComObject WScript.Shell).AppActivate($env:NOVA_ARG)",
-                                   NOVA_ARG=m.group(1)).stdout:
+        if _focus_window(m.group(1)):
             return f"Switched to {m.group(1)}."
         return f"I couldn't find a window called {m.group(1)}."
 
-    # --- info ---
+    # --- info & installed applications ---
+    if re.search(r"\b(?:refresh|rescan|reload)\b.*\b(?:apps?|applications?|programs?)\b", t):
+        installed_apps(refresh=True)
+        return list_installed_apps_text()
+    if re.search(
+        r"\b(?:what|which|list|show|read|see|check|find)\b.*\b(?:apps?|applications?|programs?|software)\b.*"
+        r"\b(?:installed|on (?:my|this|the) (?:laptop|pc|computer))\b|"
+        r"\b(?:installed|available) (?:apps?|applications?|programs?|software)\b|"
+        r"\bcan you (?:see|read) (?:my |the )?(?:apps?|applications?|programs?)\b",
+        t,
+    ):
+        return list_installed_apps_text()
+    if m := re.match(r"do i have (.+?)\s+(?:app\s+|program\s+)?installed(?:\s+on\s+(?:my|this|the)\s+(?:laptop|pc|computer))?$", t):
+        return list_installed_apps_text(m.group(1))
     if re.search(r"\bbattery\b", t):
         return battery()
     if re.search(r"\b(disk|storage|drive)\b.*\b(space|left|free)\b|\bhow much (disk |storage )?space\b", t):

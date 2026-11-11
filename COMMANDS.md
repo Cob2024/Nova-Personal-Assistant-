@@ -35,7 +35,8 @@ Optional **Internet** commands fetch live data (weather, Wikipedia summaries, we
 - **Browsers & Office**: `chrome` (`google chrome`), `edge` (`microsoft edge`), `firefox`, `word`, `excel`, `powerpoint`, `outlook`, `notepad`, `paint`
 - **Dev & System**: `vs code` (`vscode`, `visual studio code`), `terminal`, `command prompt` (`cmd`), `task manager`, `file explorer` (`explorer`), `control panel`, `snipping tool`, `calculator`
 - **Communication & Media**: `whatsapp` (also catches Whisper's `"what's up"` / `"whats up"`), `telegram`, `discord`, `slack`, `teams`, `zoom`, `spotify`, `vlc`, `camera`, `store`, `clock`
-- **Any Start Menu app**: `"Open <installed app name>"` searches all installed Windows Start Menu apps automatically.
+- **Any Start Menu app**: `"Open <installed app name>"` searches all installed Windows Start Menu apps, App Paths registry entries, and Desktop shortcuts automatically, bringing minimized or tray apps straight to the foreground.
+- **Read installed apps**: `"What apps are installed on my laptop?"`, `"Read installed apps"`, `"Do I have Photoshop installed?"`, `"Refresh installed apps"`
 - **Close apps**: `"Close Chrome"`, `"Quit Notepad"`, `"Kill Spotify"`, `"Exit VS Code"`, `"Close WhatsApp"` *(checks built-in process map and all running `.exe` names politely without forcing unsaved data loss)*.
 - **Switch to app window**: `"Switch to Chrome"`, `"Switch to VS Code"`.
 
@@ -89,7 +90,8 @@ Optional **Internet** commands fetch live data (weather, Wikipedia summaries, we
   - `"Play music"` / `"Pause music"` / `"Resume video"`
   - `"Next song"` / `"Skip"`
   - `"Previous song"` / `"Go back"`
-  - `"Play <song or artist> on YouTube"` / `"Play <song or artist> on Spotify"`
+  - `"Play a song on Spotify"` / `"Play Spotify"` *(opens Spotify visibly and starts playback)*
+  - `"Play <song or artist> on Spotify"` / `"Play <song or artist> on YouTube"`
 
 ---
 

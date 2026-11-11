@@ -495,6 +495,7 @@ def start_organize(folder):
 
 
 FILLER = re.compile(r"^(?:(?:and|then|so|also|now)\s+|(?:hey |ok |okay )?(?:please|can you|could you|would you|will you|"
+                    r"i said|i told you to|i asked you to|just|"
                     r"i want you to|i'd like you to|i would like you to|i need you to|"
                     r"go ahead and|i want to)\s+)+")
 DONE_WORDS = r"\b(done|complete|completed|finish|finished|check off|tick off|cross off)\b"

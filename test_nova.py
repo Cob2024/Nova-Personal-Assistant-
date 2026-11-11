@@ -803,6 +803,47 @@ class NovaTests(unittest.TestCase):
             self.assertTrue(vbs.exists())
             reg.assert_called_once()
 
+    def test_installed_apps_discovery_focus_and_spotify_playback(self):
+        sample_apps = [("Adobe Photoshop 2026", r"C:\Apps\Photoshop.exe"),
+                       ("Brave", "Brave"),
+                       ("Spotify", r"C:\Apps\Spotify.exe")]
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch.object(nova_skills, "installed_apps", return_value=sample_apps), \
+             mock.patch.object(nova_skills, "start_apps", return_value=sample_apps):
+            msg = assistant.handle("what apps are installed on my laptop")
+            self.assertIn("3 installed apps", msg.lower())
+            self.assertIn("adobe photoshop", msg.lower())
+            hit = assistant.handle("do i have photoshop installed")
+            self.assertIn("adobe photoshop 2026", hit.lower())
+            tool_out = nova_skills._run_tool("list_installed_apps", {"query": "brave"})
+            self.assertIn("brave", tool_out.lower())
+
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch.object(nova_skills, "start_apps", return_value=sample_apps), \
+             mock.patch.object(nova_skills, "launch_any", return_value=True) as lm, \
+             mock.patch.object(nova_skills, "_focus_window", return_value=True):
+            self.assertEqual(assistant.handle("I said open the app Spotify on my laptop."), "Opening spotify.")
+            self.assertEqual(assistant.handle("open fortify"), "Opening fortify.")
+        self.assertEqual([c.args[0] for c in lm.call_args_list], ["spotify:", "spotify:"])
+
+        with mock.patch.object(nova_skills, "IS_WIN", True), \
+             mock.patch.object(nova_skills, "_spotify_exe", return_value=Path(r"C:\Apps\Spotify.exe")), \
+             mock.patch.object(nova_skills, "_running_procs", return_value=[]), \
+             mock.patch.object(nova_skills, "launch", return_value=True) as lfn, \
+             mock.patch.object(nova_skills, "_focus_window", return_value=True), \
+             mock.patch.object(nova_skills, "press"):
+            self.assertEqual(assistant.handle("play a song on spotify"), "Playing music on Spotify.")
+            self.assertEqual(assistant.handle("play blinding lights on spotify"), "Opening blinding lights in Spotify.")
+        self.assertEqual(lfn.call_args_list[0].args, (r"C:\Apps\Spotify.exe",))
+        self.assertEqual(lfn.call_args_list[1].args, (r"C:\Apps\Spotify.exe", "--uri=spotify:search:blinding%20lights"))
+
+        with mock.patch.object(nova_skills, "_spotify_exe", return_value=None), \
+             mock.patch.object(nova_skills, "start_apps", return_value=[]), \
+             mock.patch("webbrowser.open") as wb:
+            res = assistant.handle("play starboy on spotify")
+        self.assertIn("browser", res.lower())
+        wb.assert_called_once_with("https://open.spotify.com/search/starboy")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
