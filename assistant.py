@@ -1659,10 +1659,10 @@ def _ipc_handle(req):
     return {"ok": False, "error": "unknown op"}
 
 
-def _ipc_serve():
+def _ipc_serve(sock):
     while True:
         try:
-            conn, _ = _lock.accept()
+            conn, _ = sock.accept()
         except OSError:
             return
         try:
@@ -1716,7 +1716,7 @@ def already_running():
     try:
         _lock.bind(("127.0.0.1", IPC_PORT))
         _lock.listen(5)
-        threading.Thread(target=_ipc_serve, daemon=True).start()
+        threading.Thread(target=_ipc_serve, args=(_lock,), daemon=True).start()
         return False
     except OSError:
         return True
