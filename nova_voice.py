@@ -95,6 +95,8 @@ def _play_mp3(path, stop_event=None):
     """Play an mp3 with Windows' built-in MCI player (interruptible when stop_event is set)."""
     if not IS_WIN:
         raise OSError("mp3 playback needs Windows")
+    if os.path.getsize(path) <= 0:
+        raise OSError("empty audio file")
     mci = ctypes.windll.winmm.mciSendStringW
     mci.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
     mci.restype = ctypes.c_uint
@@ -120,7 +122,7 @@ def _play_mp3(path, stop_event=None):
                 break
             if buf.value.strip().lower() not in ("playing", "paused"):
                 break
-            stop_event.wait(0.03)
+            stop_event.wait(0.015)
     finally:
         mci(f"stop {alias}", None, 0, None)
         mci(f"close {alias}", None, 0, None)
@@ -128,12 +130,12 @@ def _play_mp3(path, stop_event=None):
 
 def _split_sentences(text):
     text = " ".join(text.split())
-    if len(text) <= 120:
+    if len(text) <= 90:
         return [text] if text else []
     raw = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
     out = []
     for part in raw:
-        if out and len(out[-1]) < 24:
+        if out and len(out[-1]) < 14:
             out[-1] = f"{out[-1]} {part}"
         else:
             out.append(part)
@@ -149,14 +151,70 @@ class Voice:
         self.sapi_args = (sapi_hints, sapi_rate, sapi_pitch)
         self._sapi, self.failed, self._neural_retry_at, self.last_engine = None, set(), 0.0, None
         self._lock = threading.Lock()
+        self._sapi_lock = threading.Lock()
         self._stop = threading.Event()
+        self._closing = False
+        self.last_tts_ms = 0.0
+        self.last_play_ms = 0.0
+
+    def prewarm_sapi(self):
+        """Warm the Windows speech subprocess ahead of time so offline fallback is instant."""
+        if not IS_WIN or self._closing or "sapi" in self.failed:
+            return
+        with self._sapi_lock:
+            if self._sapi is None or self._sapi.p.poll() is not None:
+                try:
+                    self._sapi = _Sapi(*self.sapi_args)
+                except Exception:
+                    pass
+
+    def prewarm_sapi_async(self):
+        threading.Thread(target=self.prewarm_sapi, daemon=True).start()
 
     def stop(self):
         """Interrupt any active speech immediately."""
         self._stop.set()
-        sapi = self._sapi
+        with self._sapi_lock:
+            sapi, self._sapi = self._sapi, None
         if sapi is not None:
             sapi.close()
+        if IS_WIN and not self._closing and "sapi" not in self.failed:
+            self.prewarm_sapi_async()
+
+    def _cache_path(self, text):
+        key = hashlib.sha1(f"{self.name}|{self.rate}|{self.pitch}|{text}".encode("utf-8")).hexdigest()
+        return CACHE / f"{key}.mp3"
+
+    def speak_ack(self, text):
+        """Speak a quick acknowledgement without waiting on cold remote synthesis."""
+        clean = " ".join((text or "").split())
+        if not clean:
+            return None
+        path = self._cache_path(clean)
+        with self._lock:
+            self._stop.clear()
+            if self.engine != "sapi" and path.exists():
+                try:
+                    if path.stat().st_size > 0 and not self._stop.is_set():
+                        t0 = time.perf_counter()
+                        _play_mp3(str(path), stop_event=self._stop)
+                        self.last_play_ms = (time.perf_counter() - t0) * 1000.0
+                        self.last_engine = "neural"
+                        return "neural"
+                except Exception:
+                    pass
+            with self._sapi_lock:
+                sapi = self._sapi
+            if IS_WIN and sapi is not None and sapi.p.poll() is None and not self._stop.is_set():
+                try:
+                    t0 = time.perf_counter()
+                    sapi.say(clean)
+                    self.last_play_ms = (time.perf_counter() - t0) * 1000.0
+                    self.last_engine = "sapi"
+                    return "sapi"
+                except Exception:
+                    pass
+        return None
 
     def say(self, text):
         """Speak and wait until finished (or interrupted via stop()). Returns the engine used, or None."""
@@ -166,6 +224,8 @@ class Voice:
             return None
         with self._lock:
             self._stop.clear()
+            self.last_tts_ms = 0.0
+            self.last_play_ms = 0.0
             for eng in order:
                 if eng in self.failed or (eng == "neural" and time.time() < self._neural_retry_at):
                     continue
@@ -176,7 +236,9 @@ class Voice:
                         for chunk in chunks:
                             if self._stop.is_set():
                                 break
+                            t0 = time.perf_counter()
                             self._windows(chunk)
+                            self.last_play_ms += (time.perf_counter() - t0) * 1000.0
                     self.last_engine = eng
                     return eng
                 except ImportError:                       # edge-tts isn't installed: don't keep trying
@@ -212,16 +274,17 @@ class Voice:
             raise OSError("the Windows voice needs Windows")
         if self._stop.is_set():
             return
-        if self._sapi is None or self._sapi.p.poll() is not None:
-            self._sapi = _Sapi(*self.sapi_args)
-        self._sapi.say(text)
+        with self._sapi_lock:
+            if self._sapi is None or self._sapi.p.poll() is not None:
+                self._sapi = _Sapi(*self.sapi_args)
+            sapi = self._sapi
+        sapi.say(text)
 
     def _fetch_neural(self, text):
         import edge_tts
-        key = hashlib.sha1(f"{self.name}|{self.rate}|{self.pitch}|{text}".encode("utf-8")).hexdigest()
-        path = CACHE / f"{key}.mp3"
+        path = self._cache_path(text)
         if not path.exists():
-            tmp = CACHE / f"{key}.{threading.get_ident()}.part"
+            tmp = CACHE / f"{path.stem}.{threading.get_ident()}.part"
 
             async def fetch():
                 await asyncio.wait_for(
@@ -234,9 +297,13 @@ class Voice:
         return path
 
     def _neural(self, text):
+        t0 = time.perf_counter()
         path = self._fetch_neural(text)
+        self.last_tts_ms += (time.perf_counter() - t0) * 1000.0
         if not self._stop.is_set():
+            t1 = time.perf_counter()
             _play_mp3(str(path), stop_event=self._stop)
+            self.last_play_ms += (time.perf_counter() - t1) * 1000.0
 
     def warm(self, phrases):
         """Pre-render common phrases (neural voice only) so they play instantly later."""
@@ -247,12 +314,11 @@ class Voice:
         except ImportError:
             return
         for text in phrases:
-            key = hashlib.sha1(f"{self.name}|{self.rate}|{self.pitch}|{text}".encode("utf-8")).hexdigest()
-            path = CACHE / f"{key}.mp3"
+            path = self._cache_path(text)
             if path.exists():
                 continue
             try:
-                tmp = CACHE / f"{key}.{threading.get_ident()}.part"
+                tmp = CACHE / f"{path.stem}.{threading.get_ident()}.part"
 
                 async def fetch():
                     await asyncio.wait_for(
@@ -265,9 +331,17 @@ class Voice:
             except Exception:
                 return
 
+    def warm_async(self, phrases):
+        """Pre-warm Windows SAPI and common neural acknowledgement phrases in background."""
+        self.prewarm_sapi_async()
+        threading.Thread(target=self.warm, args=(phrases,), daemon=True).start()
+
     def close(self):
-        if self._sapi:
-            self._sapi.close()
+        self._closing = True
+        with self._sapi_lock:
+            sapi, self._sapi = self._sapi, None
+        if sapi:
+            sapi.close()
 
 
 # ========================= "only listen to me" =========================

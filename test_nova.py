@@ -9,8 +9,10 @@ from unittest import mock
 
 import assistant
 import nova_calendar
+import nova_context
 import nova_memory
 import nova_skills
+import nova_tasks
 import nova_voice
 
 
@@ -20,38 +22,55 @@ class NovaTests(unittest.TestCase):
         self._orig_rem = nova_skills.REM_FILE
         self._orig_notes = nova_skills.NOTES
         self._orig_routines = nova_skills.ROUTINES_FILE
+        self._orig_apps_cache = nova_skills.APPS_CACHE
         self._orig_events = nova_calendar.EVENTS_FILE
         self._orig_cal_dir = nova_calendar.CAL_DIR
         self._orig_cal_cfg = nova_calendar.CONFIG_FILE
         self._orig_tasks = assistant.TASKS_FILE
         self._orig_mem = nova_skills._mem
+        self._orig_tm = nova_skills._task_mgr
+        self._orig_perf = nova_skills._perf
+        self._orig_exec_log = nova_skills._exec_log
+        self._orig_session = nova_skills._session
         self.tmp = tempfile.TemporaryDirectory()
         tmp_path = Path(self.tmp.name)
         nova_skills.CONFIG_FILE = tmp_path / "config.json"
         nova_skills.REM_FILE = tmp_path / "reminders.json"
         nova_skills.NOTES = tmp_path / "Nova Notes.txt"
         nova_skills.ROUTINES_FILE = tmp_path / "routines.json"
+        nova_skills.APPS_CACHE = tmp_path / "apps_cache.json"
         nova_calendar.EVENTS_FILE = tmp_path / "events.json"
         nova_calendar.CAL_DIR = tmp_path / "calendars"
         nova_calendar.CONFIG_FILE = nova_skills.CONFIG_FILE
         nova_calendar._alerted.clear()
         assistant.TASKS_FILE = tmp_path / "tasks.json"
         nova_skills._mem = nova_memory.Memory(tmp_path / "memory.db")
+        nova_skills._task_mgr = nova_tasks.TaskManager()
+        nova_skills._perf = nova_tasks.PerfMonitor(tmp_path / "perf.jsonl")
+        nova_skills._exec_log = nova_tasks.ExecutionLogger(tmp_path / "execution.log")
+        nova_skills._session = nova_context.SessionContext()
         nova_skills.reset_ai()
         nova_skills.reset_ai_cooldown()
         assistant.setup_skills()
 
     def tearDown(self):
+        if nova_skills._task_mgr is not None:
+            nova_skills._task_mgr.shutdown()
         nova_skills.CONFIG_FILE = self._orig_cfg
         nova_skills.REM_FILE = self._orig_rem
         nova_skills.NOTES = self._orig_notes
         nova_skills.ROUTINES_FILE = self._orig_routines
+        nova_skills.APPS_CACHE = self._orig_apps_cache
         nova_calendar.EVENTS_FILE = self._orig_events
         nova_calendar.CAL_DIR = self._orig_cal_dir
         nova_calendar.CONFIG_FILE = self._orig_cal_cfg
         nova_calendar._alerted.clear()
         assistant.TASKS_FILE = self._orig_tasks
         nova_skills._mem = self._orig_mem
+        nova_skills._task_mgr = self._orig_tm
+        nova_skills._perf = self._orig_perf
+        nova_skills._exec_log = self._orig_exec_log
+        nova_skills._session = self._orig_session
         nova_skills.reset_ai()
         nova_skills.reset_ai_cooldown()
         self.tmp.cleanup()
@@ -781,6 +800,8 @@ class NovaTests(unittest.TestCase):
             with zipfile.ZipFile(z) as zf:
                 names = set(zf.namelist())
             self.assertIn("NovaAssistant/assistant.py", names)
+            self.assertIn("NovaAssistant/nova_tasks.py", names)
+            self.assertIn("NovaAssistant/nova_context.py", names)
             self.assertIn("NovaAssistant/Install_Nova.bat", names)
             self.assertNotIn("NovaAssistant/.env", names)
 
@@ -798,6 +819,8 @@ class NovaTests(unittest.TestCase):
                 out_dest = install_nova.install_app(dest_dir=dest, autostart=True, desktop=True, launch_now=False)
             self.assertEqual(out_dest, dest.resolve())
             self.assertTrue((dest / "assistant.py").exists())
+            self.assertTrue((dest / "nova_tasks.py").exists())
+            self.assertTrue((dest / "nova_context.py").exists())
             self.assertTrue((sm_dir / "Customize Assistant.lnk").exists())
             self.assertTrue(desk_lnk.exists())
             self.assertTrue(vbs.exists())
@@ -843,6 +866,196 @@ class NovaTests(unittest.TestCase):
             res = assistant.handle("play starboy on spotify")
         self.assertIn("browser", res.lower())
         wb.assert_called_once_with("https://open.spotify.com/search/starboy")
+
+    def test_simple_command_bypasses_llm_under_50ms(self):
+        import time
+        with mock.patch.object(nova_skills, "ask_ai", side_effect=AssertionError("LLM must not be called")):
+            t0 = time.perf_counter()
+            ans1 = assistant.handle("what is 14 times 7")
+            ans2 = assistant.handle("what time is it")
+            ms = (time.perf_counter() - t0) * 1000.0
+        self.assertIn("98", ans1)
+        self.assertTrue(any(x in ans2.lower() for x in ("am", "pm")))
+        self.assertLess(ms, 100.0)
+
+    def test_contextual_followup_folder_pdf_open_read_summarize(self):
+        import io
+        import time
+        import zipfile
+        dl = Path(self.tmp.name) / "Downloads"
+        dl.mkdir()
+        old_pdf = dl / "old_notes.pdf"
+        old_pdf.write_bytes(b"%PDF-1.4 old")
+        os.utime(old_pdf, (time.time() - 100, time.time() - 100))
+        new_pdf = dl / "Q4_Report.pdf"
+        new_pdf.write_bytes(b"%PDF-1.4 new")
+        docx_path = dl / "brief.docx"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(
+                "word/document.xml",
+                '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                "<w:body><w:p><w:r><w:t>Project Nova latency target is under 500ms. Memory compaction is active.</w:t></w:r></w:p></w:body></w:document>",
+            )
+        docx_path.write_bytes(buf.getvalue())
+
+        with mock.patch.object(nova_skills, "HOME", Path(self.tmp.name)), \
+             mock.patch.object(nova_skills, "open_path", return_value=True) as op, \
+             mock.patch.object(nova_skills, "ai_ready", return_value=False):
+            r1 = assistant.handle("Open my Downloads folder")
+            self.assertIn("downloads", r1.lower())
+            r2 = assistant.handle("Find the latest PDF")
+            self.assertIn("Q4_Report.pdf", r2)
+            r3 = assistant.handle("Open it")
+            self.assertEqual(r3, "Opening Q4_Report.pdf.")
+            self.assertEqual(Path(op.call_args_list[-1].args[0]).name, "Q4_Report.pdf")
+
+            r4 = assistant.handle("read brief.docx")
+            self.assertIn("under 500ms", r4)
+            r5 = assistant.handle("summarize it")
+            self.assertIn("Project Nova latency target", r5)
+
+    def test_contextual_web_search_and_second_result_followup(self):
+        fake_opensearch = [
+            "figma tutorials",
+            ["Figma", "Figma Design Basics", "Figma Auto Layout"],
+            ["Collaborative UI tool.", "Learn frames and components.", "Responsive layouts in Figma."],
+            ["https://en.wikipedia.org/wiki/Figma", "https://example.com/figma-basics", "https://example.com/figma-auto"],
+        ]
+        with mock.patch("webbrowser.open") as wb, \
+             mock.patch.object(nova_skills, "_http_json", return_value=fake_opensearch):
+            r1 = assistant.handle("Search for Figma tutorials")
+            self.assertIn("searching the web for figma tutorials", r1.lower())
+            wb.assert_called_with("https://www.google.com/search?q=figma%20tutorials")
+            nova_skills._search_ready.wait(timeout=2.0)
+
+        with mock.patch("webbrowser.open") as wb2, \
+             mock.patch.object(nova_skills, "ai_ready", return_value=False), \
+             mock.patch.object(nova_skills, "read_webpage", return_value="Figma basics guide covers frames, components, and auto layout cleanly."):
+            r2 = assistant.handle("Open the second result")
+            self.assertIn("Figma Design Basics", r2)
+            wb2.assert_called_once_with("https://example.com/figma-basics")
+            r3 = assistant.handle("Summarize the second result")
+            self.assertIn("Figma basics guide", r3)
+
+    def test_parallel_compound_execution_and_acknowledgement(self):
+        import time
+        acks = []
+
+        def fake_open(name, interactive=True):
+            time.sleep(0.08)
+            return f"Opening {name}."
+
+        def fake_dl(_folder):
+            time.sleep(0.08)
+            return "Downloads has 3 files."
+
+        def fake_batt():
+            time.sleep(0.08)
+            return "Battery at 92%."
+
+        with mock.patch.object(nova_skills, "open_thing", side_effect=fake_open), \
+             mock.patch.object(nova_skills, "check_folder_text", side_effect=fake_dl), \
+             mock.patch.object(nova_skills, "battery", side_effect=fake_batt):
+            t0 = time.perf_counter()
+            ans = assistant.handle("Open Chrome, check my Downloads folder and tell me my battery level", on_ack=acks.append)
+            elapsed = time.perf_counter() - t0
+        self.assertEqual(len(acks), 1)
+        self.assertIn("Opening chrome", ans)
+        self.assertIn("Downloads has 3 files", ans)
+        self.assertIn("Battery at 92%", ans)
+        self.assertLess(elapsed, 0.20)
+
+    def test_barge_in_cancels_speech_and_active_tasks(self):
+        started = threading.Event()
+        stopped = threading.Event()
+
+        def long_job(cancel_event):
+            started.set()
+            cancel_event.wait(timeout=2.0)
+            stopped.set()
+            return "aborted"
+
+        tm = nova_skills.task_manager()
+        rec = tm.submit("Long export", long_job)
+        self.assertTrue(started.wait(timeout=1.0))
+
+        fake_voice = mock.Mock()
+        orig_voice = assistant._voice
+        assistant._voice = fake_voice
+        try:
+            assistant._stop_speech_event.clear()
+            assistant.stop_speaking()
+            self.assertTrue(assistant._stop_speech_event.is_set())
+            fake_voice.stop.assert_called_once()
+            self.assertTrue(stopped.wait(timeout=1.0))
+            self.assertTrue(rec.cancel_event.is_set())
+            status_txt = assistant.handle("what tasks are running")
+            self.assertTrue("no active" in status_txt.lower() or "cancelled" in status_txt.lower())
+        finally:
+            assistant._voice = orig_voice
+            assistant._stop_speech_event.clear()
+
+    def test_privacy_mode_and_security_controls(self):
+        r_on = assistant.handle("privacy mode on")
+        self.assertTrue(assistant._privacy_mode())
+        self.assertIn("paused", r_on.lower())
+        r_off = assistant.handle("privacy mode off")
+        self.assertFalse(assistant._privacy_mode())
+        self.assertIn("listening again", r_off.lower())
+
+        env_p = Path(self.tmp.name) / ".env"
+        env_p.write_text("OPENROUTER_API_KEY=secret-test-key", encoding="utf-8")
+        sec_msg = nova_skills.read_document(str(env_p))
+        self.assertIn("security", sec_msg.lower())
+        db_msg = nova_skills.read_document(str(nova_skills._mem.db_path))
+        self.assertIn("security", db_msg.lower())
+
+        bad_shell = assistant.handle("run command format c: /fs:ntfs")
+        self.assertIn("blocked", bad_shell.lower())
+        bad_shell2 = assistant.handle("execute command del /s /q C:\\Windows")
+        self.assertIn("blocked", bad_shell2.lower())
+
+    def test_memory_ranking_pinning_compaction_and_perf_stats(self):
+        m = nova_skills._mem
+        for i in range(18):
+            m.add_episode(f"question {i}", f"answer {i}")
+        removed = m.compact_episodes(keep_recent=6)
+        self.assertEqual(removed, 12)
+        self.assertEqual(m.stats()["episodes"], 6)
+        self.assertGreaterEqual(m.stats()["summaries"], 1)
+
+        m.remember("favorite_editor", "VS Code", "preference")
+        m.remember("coffee_order", "oat flat white", "preference")
+        pin_msg = assistant.handle("pin fact favorite_editor")
+        self.assertIn("pinned", pin_msg.lower())
+        m.track_app_usage("Spotify")
+        m.track_app_usage("Spotify")
+        ctx_prompt = m.context_summary(query="play music")
+        self.assertIn("VS Code", ctx_prompt)
+        self.assertIn("Spotify", ctx_prompt)
+
+        ms = assistant.handle("memory stats")
+        self.assertIn("saved facts", ms.lower())
+        nova_skills.perf_monitor().record_turn({"total_ms": 22.5, "first_reply_ms": 11.2})
+        ps = assistant.handle("performance stats")
+        self.assertIn("latency report", ps.lower())
+        self.assertIn("milliseconds", ps.lower())
+
+    def test_conn_pool_reuse_and_apps_disk_cache(self):
+        sample = [("Notion", r"C:\Apps\Notion.exe")]
+        nova_skills._start = None
+        nova_skills._save_apps_cache(sample)
+        with mock.patch.object(nova_skills, "_discover_installed_apps", side_effect=AssertionError("Should hit disk cache")):
+            apps = nova_skills.start_apps()
+        self.assertEqual(apps, sample)
+
+        pool = nova_skills._ConnPool()
+        fake_conn = mock.Mock()
+        fake_conn.sock = mock.Mock()
+        pool._release("https", "api.example.com", 443, fake_conn, will_close=False)
+        reused = pool._acquire("https", "api.example.com", 443, 10)
+        self.assertIs(reused, fake_conn)
 
 
 if __name__ == "__main__":

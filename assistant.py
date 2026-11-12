@@ -161,8 +161,12 @@ def reload_voice():
 
 
 def stop_speaking():
-    """Interrupt any ongoing Nova speech and LLM stream immediately (hotkey or click)."""
+    """Interrupt any ongoing Nova speech, background tasks, and LLM stream immediately."""
     _stop_speech_event.set()
+    if skills and hasattr(skills, "task_manager"):
+        tm = skills.task_manager()
+        if tm:
+            tm.cancel()
     v = _voice
     if v is not None and hasattr(v, "stop"):
         v.stop()
@@ -200,6 +204,21 @@ def _speak_windows(text):
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,   # hidden (pythonw) runs
                    stderr=subprocess.DEVNULL,                            # have no console handles
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def say_ack(text):
+    """Speak a cached/warmed acknowledgement immediately without blocking on remote TTS."""
+    print("🤖", text, flush=True)
+    UI.post("executing", text)
+    v = _get_voice()
+    if v is not None and hasattr(v, "speak_ack"):
+        with _speech_lock:
+            _speaking.set()
+            try:
+                return v.speak_ack(text)
+            finally:
+                _speaking.clear()
+    return None
 
 
 def say(text):
@@ -325,7 +344,7 @@ class Mic:
                     self.ambient = min(0.015, 0.95 * self.ambient + 0.05 * level)
             if started:
                 chunks.append(block)
-                if quiet > 7 or time.time() - t_start > max_seconds:
+                if quiet > 6 or time.time() - t_start > max_seconds:
                     break
             else:
                 pre.append(block)
@@ -349,7 +368,7 @@ class Mic:
                     return ""
         segments, _ = self.model.transcribe(
             audio, language="en", vad_filter=True, vad_parameters={"threshold": 0.3},
-            beam_size=5, initial_prompt=COMMAND_HINT if commands else None)
+            beam_size=1, initial_prompt=COMMAND_HINT if commands else None)
         # keep only segments Whisper is confident are real speech
         text = " ".join(x.text for x in segments
                         if x.no_speech_prob < 0.6 and x.avg_logprob > -1.0).strip()
@@ -529,7 +548,17 @@ def new_task(text):
     return add_task(text) if text else ask("Sure. What should the task say?", new_task)
 
 
-def handle(raw, on_sentence=None, stop_event=None):
+def _privacy_mode(set_to=None):
+    if skills and hasattr(skills, "session_ctx"):
+        sc = skills.session_ctx()
+        if sc is not None:
+            if set_to is not None:
+                sc.privacy_mode = bool(set_to)
+            return sc.privacy_mode
+    return False
+
+
+def handle(raw, on_sentence=None, stop_event=None, on_ack=None):
     global awaiting
     t = clean(raw)
     if not t:
@@ -541,6 +570,14 @@ def handle(raw, on_sentence=None, stop_event=None):
     if re.fullmatch(rf"(?:please )?(?:quit|exit)(?: (?:nova|{aname_re}))?(?: please)?", t) or \
             re.search(rf"\b(shut ?down|turn off|power off|quit|exit) (?:nova|{aname_re})\b", t):
         raise SystemExit("Okay, shutting down. Goodbye!")
+    if re.search(r"\b(?:privacy mode on|stop listening|pause listening|go private|mute mic(?:rophone)?)\b", t):
+        _privacy_mode(True)
+        UI.post("privacy")
+        return "Privacy mode is on. I paused the microphone until you wake me with the shortcut or turn privacy mode off."
+    if re.search(r"\b(?:privacy mode off|resume listening|start listening|unmute mic(?:rophone)?)\b", t):
+        _privacy_mode(False)
+        UI.post("listening")
+        return "Privacy mode is off. I'm listening again."
     if awaiting:
         step, awaiting = awaiting, None
         if re.search(r"\b(cancel|never ?mind|forget(?: about)?(?: it| that| this| one)?|skip)\b", t) or \
@@ -556,7 +593,7 @@ def handle(raw, on_sentence=None, stop_event=None):
         raise EndSession(random.choice(farewells))
 
     if skills:
-        reply = skills.route(t, raw)
+        reply = skills.route(t, raw, on_ack=on_ack) if on_ack is not None else skills.route(t, raw)
         if reply is not None:
             return reply
 
@@ -682,14 +719,44 @@ def setup_skills():
 _ai_hinted = False
 
 
+def _record_turn_perf(metrics):
+    if skills and hasattr(skills, "perf_monitor"):
+        pm = skills.perf_monitor()
+        if pm:
+            pm.record_turn(metrics)
+
+
 def respond(text, stream=True):
     """Handle one utterance (streaming AI sentences into speech when stream=True). Returns True if session ends."""
+    t0 = time.perf_counter()
+    first_ms = None
     try:
         _stop_speech_event.clear()
+
+        def on_ack(msg):
+            nonlocal first_ms
+            if first_ms is None:
+                first_ms = (time.perf_counter() - t0) * 1000.0
+            if msg and not _stop_speech_event.is_set():
+                threading.Thread(target=say_ack, args=(msg,), daemon=True).start()
+
         if not stream:
-            reply = handle(text)
+            reply = handle(text, on_ack=on_ack)
+            if first_ms is None:
+                first_ms = (time.perf_counter() - t0) * 1000.0
             if reply:
+                if awaiting:
+                    UI.post("confirm", reply)
                 say(reply)
+                if not awaiting and not _stop_speech_event.is_set():
+                    UI.post("done", reply)
+            v = _get_voice()
+            _record_turn_perf({
+                "total_ms": (time.perf_counter() - t0) * 1000.0,
+                "first_reply_ms": first_ms,
+                "tts_ms": getattr(v, "last_tts_ms", 0.0) if v else 0.0,
+                "play_ms": getattr(v, "last_play_ms", 0.0) if v else 0.0,
+            })
             return False
         q = queue.Queue()
         spoken = []
@@ -709,17 +776,33 @@ def respond(text, stream=True):
         worker.start()
 
         def emit(sentence):
+            nonlocal first_ms
+            if first_ms is None:
+                first_ms = (time.perf_counter() - t0) * 1000.0
             if sentence and not _stop_speech_event.is_set():
                 spoken.append(sentence)
                 q.put(sentence)
 
         try:
-            reply = handle(text, on_sentence=emit, stop_event=_stop_speech_event)
+            reply = handle(text, on_sentence=emit, stop_event=_stop_speech_event, on_ack=on_ack)
         finally:
             q.put(None)
             worker.join()
+        if first_ms is None:
+            first_ms = (time.perf_counter() - t0) * 1000.0
         if not spoken and reply and not _stop_speech_event.is_set():
+            if awaiting:
+                UI.post("confirm", reply)
             say(reply)
+        if not awaiting and not _stop_speech_event.is_set() and (spoken or reply):
+            UI.post("done")
+        v = _get_voice()
+        _record_turn_perf({
+            "total_ms": (time.perf_counter() - t0) * 1000.0,
+            "first_reply_ms": first_ms,
+            "tts_ms": getattr(v, "last_tts_ms", 0.0) if v else 0.0,
+            "play_ms": getattr(v, "last_play_ms", 0.0) if v else 0.0,
+        })
         return False
     except EndSession as e:
         say(str(e))
@@ -727,6 +810,7 @@ def respond(text, stream=True):
     except Exception:                          # a bug in one ability must never kill Nova
         import traceback
         traceback.print_exc()
+        UI.post("error", "Sorry, something went wrong with that.")
         say("Sorry, something went wrong with that.")
         return False
 
@@ -947,8 +1031,26 @@ class IslandCore:
     ORB = 46                                                    # diameter of Nova's orb
     supports_orb = False                                        # the smooth renderer turns this on
     PALETTE = [(0, 200, 255), (60, 110, 255), (170, 80, 255), (255, 60, 170), (255, 150, 60)]
-    TINT = {"listening": (90, 140, 255), "thinking": (170, 110, 255), "speaking": (80, 220, 200)}
-    LABELS = {"listening": "Listening…", "thinking": "Thinking…", "speaking": "Nova"}
+    TINT = {
+        "listening": (90, 140, 255),
+        "thinking": (170, 110, 255),
+        "executing": (255, 175, 65),
+        "confirm": (255, 200, 70),
+        "speaking": (80, 220, 200),
+        "done": (80, 230, 130),
+        "error": (255, 85, 85),
+        "privacy": (130, 135, 150),
+    }
+    LABELS = {
+        "listening": "Listening…",
+        "thinking": "Thinking…",
+        "executing": "Working…",
+        "confirm": "Confirm?",
+        "speaking": "Nova",
+        "done": "Done",
+        "error": "Error",
+        "privacy": "Paused",
+    }
     FONT_PX = {"body": 14, "you": 13, "label": 12}
     FONT_BOLD = {"body": True, "you": False, "label": True}
 
@@ -1002,8 +1104,22 @@ class IslandCore:
             self.state = "listening"
         elif kind == "heard":
             self.state, self.you, self.reply = "thinking", text, ""
+        elif kind == "executing":
+            self.state, self.reply = "executing", text or self.reply
+        elif kind == "confirm":
+            self.state, self.reply = "confirm", text or self.reply
         elif kind == "say":
             self.state, self.reply = "speaking", text
+        elif kind == "done":
+            self.state = "done"
+            if text:
+                self.reply = text
+        elif kind == "error":
+            self.state = "error"
+            if text:
+                self.reply = text
+        elif kind == "privacy":
+            self.state, self.you, self.reply, self._voiced = "privacy", "", "Microphone paused", False
 
     # ---- text measuring ----
     def _measure(self, key, text):
@@ -1073,10 +1189,12 @@ class IslandCore:
             a = _clamp(lvl * 10)
             bands = (a, a * (0.55 + 0.45 * math.sin(now * 3.1) ** 2), a * (0.5 + 0.5 * math.sin(now * 5.3 + 1) ** 2), a)
             mode = "vivid" if self._voiced else "calm"
-        elif st == "thinking":
+        elif st in ("thinking", "executing"):
             mode, bands = "vivid", (0.0, 0.0, 0.0, 0.0)
-        else:                                          # speaking: pulse as if following the voice
-            a = 0.5 + 0.35 * abs(math.sin(now * 6.3))
+        elif st == "privacy":
+            mode, bands = "calm", (0.0, 0.0, 0.0, 0.0)
+        else:                                          # speaking / confirm / done / error: gentle pulse
+            a = 0.5 + 0.35 * abs(math.sin(now * 6.3)) if st == "speaking" else 0.3
             mode, bands = "vivid", (a, a * (0.6 + 0.4 * math.sin(now * 4.1) ** 2),
                                     a * (0.5 + 0.5 * math.sin(now * 7.7) ** 2), a)
         return self.orb.advance(self._dt, mode, bands)
@@ -1091,12 +1209,14 @@ class IslandCore:
     def _scene(self):
         """The island as a list of shapes. The first is the pill (or, without a pill, an invisible box)."""
         S, t, st, items = self.S, time.time(), self.state, []
+        tint = self.TINT.get(st, self.TINT["listening"])
+        label = self.LABELS.get(st, _assistant_name())
         w, h = min(self.w.x, self.WIN_W - 4), min(self.h.x, self.WIN_H - self.TOP - 4)
         cx, y0 = self.WIN_W / 2, self.TOP
         x1, x2 = cx - w / 2, cx + w / 2
         items.append(("poly", _rounded(x1, y0, x2, y0 + h, min(h / 2, 34 * S)),
                       "#000000" if self.pill else None,
-                      _hex(_mix((0, 0, 0), self.TINT[st], .5)) if self.pill else None))   # pill + keyline tint
+                      _hex(_mix((0, 0, 0), tint, .5)) if self.pill else None))   # pill + keyline tint
         cop = _clamp((w - 100 * S) / (80 * S)) * _clamp((h - 22 * S) / (14 * S))   # content fades in
         hy, lvl, P_ = y0 + self.COMPACT[1] / 2 * S, self.lvl, self.PALETTE
         # the orb: centred; inside a pill it glides to the left as the island opens
@@ -1110,10 +1230,10 @@ class IslandCore:
             items.append(("orb", ox, hy, self.ORB * S, P, ot, cop))
         else:                                                                       # simple orb (no numpy)
             pulse = {"listening": min(4, lvl * 60), "thinking": 1.2 * math.sin(t * 6),
-                     "speaking": 2 * abs(math.sin(t * 6))}[st]
+                     "executing": 1.5 * math.sin(t * 8), "speaking": 2 * abs(math.sin(t * 6))}.get(st, 0.5)
             r = (11 + pulse) * S
             items.append(("oval", ox - r, hy - r, ox + r, hy + r, self._c(P_[2], cop)))
-            speed = {"listening": 2, "thinking": 7, "speaking": 4}[st]
+            speed = {"listening": 2, "thinking": 7, "executing": 9, "speaking": 4, "privacy": 0.5}.get(st, 2)
             for i, col in enumerate((P_[0], P_[3], P_[4])):
                 a = t * speed + i * 2.094
                 bx, by, rr = ox + math.cos(a) * r * 0.4, hy + math.sin(a) * r * 0.4, r * 0.6
@@ -1124,7 +1244,7 @@ class IslandCore:
         width = (self.EXPANDED_W - 44) * S
         if self.pill:                                                               # text inside the island
             if pe > 0.2:
-                items.append(("text", cx, hy, self.LABELS[st], "center", self._c((150, 150, 165), (pe - .3) / .4),
+                items.append(("text", cx, hy, label, "center", self._c((150, 150, 165), (pe - .3) / .4),
                               "label", None))
             pad, ty = cx - self.EXPANDED_W * S / 2 + 22 * S, y0 + 60 * S
             if self.you:
@@ -1512,6 +1632,8 @@ def session(mic):
     global awaiting
     last = time.time()
     while True:
+        if _privacy_mode():
+            return
         if skills and skills.dictating():
             last = time.time()                 # stay awake while dictating
         remaining = SESSION_TIMEOUT - (time.time() - last)
@@ -1520,7 +1642,7 @@ def session(mic):
             say("Okay, I'll be here if you need me.")
             return
         UI.post("listening")
-        time.sleep(0.25)                       # let my own voice fade before listening
+        time.sleep(0.08)                       # let my own voice fade before listening
         heard = mic.listen(wait=remaining, commands=True)
         if not heard:
             continue
@@ -1532,6 +1654,7 @@ def session(mic):
 
 
 WARM_PHRASES = (
+    "On it.", "Sure.", "Checking that.", "Working on that.", "Got it.", "One moment.",
     "One moment, getting ready.", "Nova is online.",
     f"I'm ready. Just say {NAME} when you need me.",
     "Yes?", "I'm listening.", "Hi! What do you need?",
@@ -1620,7 +1743,10 @@ def run_voice():
     background = "--background" in sys.argv
     v = _get_voice()
     if v is not None:
-        threading.Thread(target=v.warm, args=(WARM_PHRASES,), daemon=True).start()
+        if hasattr(v, "warm_async"):
+            v.warm_async(WARM_PHRASES)
+        else:
+            threading.Thread(target=v.warm, args=(WARM_PHRASES,), daemon=True).start()
     _start_hotkey()
     if not background:
         say("One moment, getting ready.")
@@ -1645,6 +1771,23 @@ def run_voice():
         say("My abilities file is missing, so I can only do the basics. Put nova skills dot pie next to my main file.")
     UI.post("hide")
     while True:
+        if _privacy_mode():
+            UI.post("privacy")
+            while _privacy_mode():
+                if _wake_event.is_set():
+                    _wake_event.clear()
+                    _privacy_mode(False)
+                    break
+                time.sleep(0.2)
+            if _privacy_mode():
+                continue
+            UI.post("wake")
+            say(_wake_reply())
+            session(mic)
+            if skills:
+                skills.reset_ai()
+            UI.post("hide")
+            continue
         heard = clean(mic.listen(wait=30, wake_event=_wake_event))
         if _wake_event.is_set():
             _wake_event.clear()
@@ -2120,6 +2263,8 @@ def run_selftest():
     row("nova_voice.py next to assistant.py", voice_mod is not None)
     row("nova_memory.py next to assistant.py", memory_mod is not None)
     row("nova_calendar.py next to assistant.py", cal_mod is not None)
+    row("nova_tasks.py next to assistant.py", bool(skills and getattr(skills, "tasks_mod", None)))
+    row("nova_context.py next to assistant.py", bool(skills and getattr(skills, "ctx_mod", None)))
     for mod, why in (("faster_whisper", "hearing"), ("sounddevice", "microphone"), ("numpy", "audio and the Siri orb"),
                      ("edge_tts", "Jarvis British voice (Windows SAPI is the backup)"),
                      ("sherpa_onnx", "voice lock (only listen to you)"),
@@ -2148,10 +2293,55 @@ def run_selftest():
     print("Done. Send me any MISSING lines that matter.")
 
 
+def run_benchmark():
+    """Run deterministic Stage 7 latency benchmarks (plus optional --live LLM stream test)."""
+    setup_skills()
+    results = {}
+
+    def bench(name, fn):
+        t0 = time.perf_counter()
+        out = fn()
+        ms = (time.perf_counter() - t0) * 1000.0
+        results[name] = round(ms, 2)
+        print(f"   {name:24s} {ms:8.2f} ms  -> {str(out)[:70]}")
+
+    print(f"{_assistant_name()} latency benchmark")
+    bench("router_math", lambda: handle("what is 12 * 15"))
+    bench("router_battery", lambda: handle("check battery"))
+    bench("router_folder_check", lambda: handle("check my downloads folder"))
+    bench("router_compound_3", lambda: handle("check downloads, check my battery level and tell me the date"))
+
+    if skills:
+        skills._start = None
+        bench("apps_disk_cache_cold", lambda: len(skills.start_apps()))
+        bench("apps_mem_cache_warm", lambda: len(skills.start_apps()))
+        m = skills._memory()
+        if m:
+            bench("mem_context_query", lambda: len(m.context_summary(query="downloads spotify coding")))
+        if "--live" in sys.argv and skills.ai_ready() and not skills.ai_blocked():
+            first_tok = []
+            t0 = time.perf_counter()
+            skills.ask_ai("Say hello in five words.",
+                          on_sentence=lambda s: first_tok.append(((time.perf_counter() - t0) * 1000.0, s)))
+            total = (time.perf_counter() - t0) * 1000.0
+            results["live_llm_first_sent_ms"] = round(first_tok[0][0], 2) if first_tok else round(total, 2)
+            results["live_llm_total_ms"] = round(total, 2)
+            print(f"   live_llm_first_sent      {results['live_llm_first_sent_ms']:8.2f} ms")
+            print(f"   live_llm_total           {results['live_llm_total_ms']:8.2f} ms")
+        pm = skills.perf_monitor()
+        if pm:
+            pm.record_turn({"total_ms": results["router_battery"], "first_reply_ms": results["router_math"]})
+            print("  ", pm.report_text())
+    return results
+
+
 def main():
     setup_logging()
     if "--selftest" in sys.argv:
         run_selftest()
+        return
+    if "--benchmark" in sys.argv:
+        run_benchmark()
         return
     if "--setup-ai" in sys.argv:
         skills.setup_ai() if skills else print("nova_skills.py not found.")

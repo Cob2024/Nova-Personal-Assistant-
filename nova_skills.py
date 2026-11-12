@@ -8,6 +8,7 @@ import base64
 import csv
 import ctypes
 import difflib
+import http.client
 from html.parser import HTMLParser
 import io
 import json
@@ -25,6 +26,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
@@ -38,11 +41,23 @@ try:
 except ImportError:
     cal_mod = None
 
+try:
+    import nova_tasks as tasks_mod
+except ImportError:
+    tasks_mod = None
+
+try:
+    import nova_context as ctx_mod
+except ImportError:
+    ctx_mod = None
+
 HOME = Path.home()
 DATA = HOME / ".laptop_assistant"
 DATA.mkdir(exist_ok=True)
 UNDO_FILE, REM_FILE, CONFIG_FILE = DATA / "last_move.json", DATA / "reminders.json", DATA / "config.json"
 ROUTINES_FILE = DATA / "routines.json"
+APPS_CACHE = DATA / "apps_cache.json"
+APPS_CACHE_TTL = 6 * 3600
 NOTES = HOME / "Documents" / "Nova Notes.txt"
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 ENV_FILE = APP_DIR / ".env"
@@ -77,6 +92,70 @@ _load_dotenv()
 ctx = {}                       # filled in by assistant.py (ask, is_yes, alert, task functions)
 state = {"dictating": False}
 _lock = threading.Lock()
+_task_mgr = None
+_perf = None
+_exec_log = None
+_session = None
+
+
+def task_manager():
+    global _task_mgr
+    if _task_mgr is None and tasks_mod:
+        _task_mgr = tasks_mod.TaskManager()
+    return _task_mgr
+
+
+def perf_monitor():
+    global _perf
+    if _perf is None and tasks_mod:
+        _perf = tasks_mod.PerfMonitor()
+    return _perf
+
+
+def execution_logger():
+    global _exec_log
+    if _exec_log is None and tasks_mod:
+        _exec_log = tasks_mod.ExecutionLogger()
+    return _exec_log
+
+
+def session_ctx():
+    global _session
+    if _session is None and ctx_mod:
+        _session = ctx_mod.SessionContext()
+    return _session
+
+
+_SENSITIVE_NAMES = {
+    ".env", ".env.local", ".env.production", "memory.db", "id_rsa", "id_ed25519",
+    "credentials.json", "secrets.json", "voiceprint.json",
+}
+_SENSITIVE_SUFFIXES = {".pem", ".key", ".pfx", ".p12"}
+_SENSITIVE_DIRS = {".ssh", ".aws", ".gnupg", ".kube"}
+_UNSAFE_SHELL_RE = re.compile(
+    r"\b(?:format|diskpart|cipher\s+/w|bcdedit|vssadmin\s+delete|reg\s+delete|"
+    r"rm\s+-rf|del\s+/[sq]|rmdir\s+/s|rd\s+/s|shutdown\s+/[srp]|takeown)\b",
+    re.I,
+)
+
+
+def _is_sensitive_path(path):
+    """True if path refers to secret/credential files or security-sensitive directories."""
+    p = Path(path)
+    name = p.name.lower()
+    if name in _SENSITIVE_NAMES or name.startswith(".env.") or p.suffix.lower() in _SENSITIVE_SUFFIXES:
+        return True
+    return any(part.lower() in _SENSITIVE_DIRS for part in p.parts)
+
+
+def _validate_shell_cmd(cmd):
+    """Reject empty or destructive shell commands before execution."""
+    c = " ".join((cmd or "").split()).strip()
+    if not c:
+        return False, "No command was provided."
+    if _UNSAFE_SHELL_RE.search(c):
+        return False, "Blocked that command because it performs destructive system or disk operations."
+    return True, ""
 
 
 def configure(**kw):
@@ -589,18 +668,70 @@ def _discover_installed_apps():
     return sorted(seen.values(), key=lambda x: x[0].lower())
 
 
+_start_refreshing = False
+
+
+def _load_apps_cache(max_age=APPS_CACHE_TTL):
+    try:
+        if not APPS_CACHE.exists():
+            return None
+        data = json.loads(APPS_CACHE.read_text(encoding="utf-8"))
+        ts = float(data.get("ts") or 0)
+        apps = data.get("apps") or []
+        if not apps or (max_age and time.time() - ts > max_age):
+            return None
+        return [(str(n), str(t)) for n, t in apps], (time.time() - ts > 1800)
+    except Exception:
+        return None
+
+
+def _save_apps_cache(apps):
+    try:
+        APPS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        APPS_CACHE.write_text(json.dumps({"ts": time.time(), "apps": apps}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _refresh_apps_bg():
+    global _start, _start_refreshing
+    if _start_refreshing:
+        return
+    _start_refreshing = True
+    try:
+        apps = _discover_installed_apps()
+        if apps:
+            _start = apps
+            _save_apps_cache(apps)
+    except Exception:
+        pass
+    finally:
+        _start_refreshing = False
+
+
 def start_apps():
-    """Every installed app found on this laptop, as (name, target). Cached after first lookup."""
+    """Every installed app found on this laptop, as (name, target). Cached on disk + memory."""
     global _start
     if _start is None:
-        _start = _discover_installed_apps()
+        cached = _load_apps_cache()
+        if cached is not None:
+            _start, stale = cached
+            if stale:
+                threading.Thread(target=_refresh_apps_bg, daemon=True).start()
+        else:
+            _start = _discover_installed_apps()
+            if _start:
+                _save_apps_cache(_start)
     return _start
 
 
 def installed_apps(refresh=False):
     global _start
     if refresh:
-        _start = None
+        _start = _discover_installed_apps()
+        if _start:
+            _save_apps_cache(_start)
+        return _start
     return start_apps()
 
 
@@ -644,6 +775,12 @@ def open_start_app(key):
             return None
     else:
         subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + target], creationflags=NOWIN)
+    if s := session_ctx():
+        s.record_app(label)
+    if m := _memory():
+        m.track_app_usage(label)
+    if lg := execution_logger():
+        lg.log("open_app", target=label)
     threading.Thread(target=lambda: (time.sleep(0.9), _focus_window(label)), daemon=True).start()
     return label
 
@@ -850,8 +987,51 @@ def folder_from(text, exact=False):
     return None
 
 
+_search_ready = threading.Event()
+
+
+def search_web_results(query, limit=5, timeout=4):
+    """Fetch ranked public search links (Wikipedia opensearch JSON API) without scraping HTML."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    url = "https://en.wikipedia.org/w/api.php?action=opensearch&search=" + urllib.parse.quote(q) + f"&limit={int(limit)}&format=json"
+    try:
+        data = _http_json(url, timeout=timeout)
+        if isinstance(data, list) and len(data) >= 4:
+            titles, descs, urls = data[1], data[2], data[3]
+            results = []
+            for i, u in enumerate(urls):
+                if isinstance(u, str) and u.startswith(("http://", "https://")):
+                    results.append({
+                        "title": str(titles[i]) if i < len(titles) else u,
+                        "snippet": str(descs[i]) if i < len(descs) else "",
+                        "url": u,
+                    })
+            return results
+    except Exception:
+        pass
+    return []
+
+
+def _bg_fetch_search(query):
+    try:
+        hits = search_web_results(query)
+        if s := session_ctx():
+            s.record_search(query, hits)
+    finally:
+        _search_ready.set()
+
+
 def web_search(query):
-    webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote(query))
+    search_url = "https://www.google.com/search?q=" + urllib.parse.quote(query)
+    webbrowser.open(search_url)
+    if s := session_ctx():
+        s.record_search(query, s.last_results if s.last_search_query == query else [])
+    _search_ready.clear()
+    threading.Thread(target=_bg_fetch_search, args=(query,), daemon=True).start()
+    if lg := execution_logger():
+        lg.log("web_search", target=query)
     return f"Searching the web for {query}."
 
 
@@ -1270,18 +1450,29 @@ def qwords(query):
 SKIP_DIRS = {"node_modules", "__pycache__", "venv", ".venv", "site-packages", "target", "dist", "build", "appdata"}
 
 
-def search_files(words, limit=20):
+def search_files(words, limit=20, base_dirs=None, exts=None):
     hits, deadline = [], time.time() + 5
-    for base in SEARCH_DIRS:
-        for root, dirs, files in os.walk(HOME / base):
+    roots = list(base_dirs) if base_dirs is not None else [HOME / base for base in SEARCH_DIRS]
+    for root_dir in roots:
+        root_p = Path(root_dir)
+        if not root_p.exists():
+            continue
+        for root, dirs, files in os.walk(root_p):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in SKIP_DIRS]
             for f in files:
-                if all(w in re.sub(r"[_\-.]+", " ", f.lower()) for w in words):
+                if f.startswith("."):
+                    continue
+                if exts and Path(f).suffix.lower() not in exts:
+                    continue
+                if not words or all(w in re.sub(r"[_\-.]+", " ", f.lower()) for w in words):
                     hits.append(Path(root) / f)
             if time.time() > deadline:
                 break
     hits.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
-    return hits[:limit]
+    res = hits[:limit]
+    if res and (s := session_ctx()):
+        s.record_files(res)
+    return res
 
 
 def find_files_text(query):
@@ -1291,12 +1482,108 @@ def find_files_text(query):
     return ("Found: " + ", ".join(h.name for h in hits[:3])) if hits else "I couldn't find that."
 
 
+def check_folder_text(folder):
+    """Inspect a folder, record context, and list its newest items."""
+    p = Path(folder)
+    if not p.exists() or not p.is_dir():
+        return f"I couldn't find the {p.name} folder."
+    files = sorted(
+        [f for f in p.iterdir() if f.is_file() and not f.name.startswith(".")],
+        key=lambda f: f.stat().st_mtime if f.exists() else 0,
+        reverse=True,
+    )
+    if s := session_ctx():
+        s.record_folder(p)
+        if files:
+            s.record_files(files[:10])
+    if lg := execution_logger():
+        lg.log("check_folder", target=str(p))
+    if not files:
+        return f"Your {p.name} folder is empty."
+    names = ", ".join(f.name for f in files[:3])
+    return f"Your {p.name} folder has {len(files)} file{'s' * (len(files) != 1)}, newest: {names}."
+
+
+def find_latest_type(kind, folder_hint=""):
+    """Find the most recent file of a given type, prioritizing the active session folder."""
+    s = session_ctx()
+    folder = folder_from(folder_hint) if folder_hint else (
+        Path(s.last_folder) if (s and s.last_folder and Path(s.last_folder).exists())
+        else (HOME / "Pictures" / "Screenshots" if "screenshot" in kind else HOME / "Downloads")
+    )
+    exts = EXTS.get(kind.lower().rstrip("s"))
+    hits = search_files([], limit=10, base_dirs=[folder], exts=exts)
+    if not hits and not folder_hint:
+        hits = search_files([], limit=10, exts=exts)
+    if s:
+        s.record_folder(folder)
+        if hits:
+            s.record_files(hits)
+    if not hits:
+        return f"I didn't find any {kind} files in {folder.name}."
+    return f"The latest {kind} in {hits[0].parent.name} is {hits[0].name}."
+
+
+def read_document(target=""):
+    """Read readable text from a local document (.txt, .md, .csv, .json, .docx) safely."""
+    q = (str(target) if target is not None else "").strip().strip('"').strip("'")
+    s = session_ctx()
+    path = None
+    if not q or q.lower() in ("it", "that", "this", "the document", "the file", "that document", "that file"):
+        if s and s.last_file:
+            path = Path(s.last_file)
+    elif (cand := Path(q)).exists() and cand.is_file():
+        path = cand
+    else:
+        roots = [Path(s.last_folder)] if (s and s.last_folder) else None
+        hits = search_files(qwords(q), limit=5, base_dirs=roots)
+        if not hits and roots is not None:
+            hits = search_files(qwords(q), limit=5)
+        if hits:
+            path = hits[0]
+    if not path or not path.exists():
+        return "I couldn't find that document."
+    if _is_sensitive_path(path):
+        if lg := execution_logger():
+            lg.log("read_document", target=str(path), status="blocked", detail="sensitive_path")
+        return "For security, I won't read sensitive credential or database files."
+    suf = path.suffix.lower()
+    if s:
+        s.record_files([path])
+    if lg := execution_logger():
+        lg.log("read_document", target=str(path))
+    try:
+        if suf == ".docx":
+            with zipfile.ZipFile(path) as zf:
+                xml_bytes = zf.read("word/document.xml")
+            tree = ET.fromstring(xml_bytes)
+            text = " ".join(node.text for node in tree.iter() if node.tag.endswith("}t") and node.text)
+            text = " ".join(text.split())
+            return text[:8000] if text else f"{path.name} appears to be empty."
+        if suf == ".pdf":
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(str(path))
+                text = " ".join((page.extract_text() or "") for page in reader.pages[:6])
+                text = " ".join(text.split())
+                return text[:8000] if text else f"{path.name} had no extractable text."
+            except ImportError:
+                return f"Found {path.name}, and I can open it, though PDF text extraction needs pypdf installed."
+        text = path.read_text(encoding="utf-8", errors="replace")
+        text = " ".join(text.split())
+        return text[:8000] if text else f"{path.name} is empty."
+    except Exception as err:
+        return f"I couldn't read {path.name}: {err}"
+
+
 def open_file(query, interactive=True):
     hits = search_files(qwords(query))
     if not hits:
         return None
     if len(hits) == 1 or not interactive:
         open_path(hits[0])
+        if s := session_ctx():
+            s.record_files([hits[0]])
         return f"Opening {hits[0].name}."
     top = hits[:3]
 
@@ -1306,6 +1593,8 @@ def open_file(query, interactive=True):
         if not 1 <= n <= len(top):
             return "Okay, never mind."
         open_path(top[n - 1])
+        if s := session_ctx():
+            s.record_files([top[n - 1]])
         return f"Opening {top[n - 1].name}."
     names = ". ".join(f"{i + 1}, {p.name}" for i, p in enumerate(top))
     return ctx["ask"](f"I found {len(hits)} matches. {names}. Which one?", pick)
@@ -1336,34 +1625,57 @@ def open_thing(name, interactive=True):
     for table in (APPS, SHELL):                                    # apps and special Windows places
         if (target := _lookup(table, key, 0.7)):
             ok = launch_any(target)
+            if ok:
+                if s := session_ctx():
+                    s.record_app(key)
+                if m := _memory():
+                    m.track_app_usage(key)
+                if lg := execution_logger():
+                    lg.log("open_app", target=key)
             if ok and IS_WIN and target != "spotify:":
                 threading.Thread(target=lambda k=key: (time.sleep(0.7), _focus_window(k)), daemon=True).start()
             return f"Opening {key}." if ok else f"I couldn't open {key}."
     base = re.sub(r"\s+settings?$", "", key)
     if base != key or key in SETTINGS:                             # "wifi settings", "bluetooth"
         if (target := _lookup(SETTINGS, base, 0.75)):
-            return f"Opening {base} settings." if launch_any(target) else f"I couldn't open {base} settings."
+            ok = launch_any(target)
+            if ok and (lg := execution_logger()):
+                lg.log("open_settings", target=base)
+            return f"Opening {base} settings." if ok else f"I couldn't open {base} settings."
     if key in SITES:
         webbrowser.open(SITES[key])
+        if s := session_ctx():
+            s.record_url(SITES[key])
         return f"Opening {key}."
     dom = key.replace(" dot ", ".").replace(" ", "")
     if re.fullmatch(r"[\w\-]+(\.[\w\-]+)*\.(com|org|net|io|co|edu|gov|ai|app)", dom):
-        webbrowser.open("https://" + dom)
+        url = "https://" + dom
+        webbrowser.open(url)
+        if s := session_ctx():
+            s.record_url(url)
         return f"Opening {dom}."
     folder = folder_from(key, exact=True)
     if folder and folder.exists():
         open_path(folder)
+        if s := session_ctx():
+            s.record_folder(folder)
+        if lg := execution_logger():
+            lg.log("open_folder", target=str(folder))
         return f"Opening your {folder.name} folder."
     if re.match(r"(latest|newest|most recent|last)\b", key):
         f = newest(HOME / "Pictures" / "Screenshots" if "screenshot" in key else HOME / "Downloads")
         if f:
             open_path(f)
+            if s := session_ctx():
+                s.record_files([f])
             return f"Opening {f.name}."
         return "I couldn't find one."
     if re.fullmatch(r"(?:nova )?notes?|notes file", key):
         NOTES.parent.mkdir(parents=True, exist_ok=True)
         NOTES.touch()
         open_path(NOTES)
+        if s := session_ctx():
+            s.record_files([NOTES])
         return "Opening your notes."
     if len(key) > 2 and (found := open_start_app(key)):           # any installed app
         return f"Opening {found}."
@@ -1626,16 +1938,31 @@ def github_status():
 
 
 def _exec_shell(cmd):
+    ok, reason = _validate_shell_cmd(cmd)
+    if not ok:
+        if lg := execution_logger():
+            lg.log("shell", target=cmd[:120], status="blocked", detail=reason)
+        return reason
+    t0 = time.perf_counter()
     try:
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20,
                            stdin=subprocess.DEVNULL, creationflags=NOWIN)
         out = " ".join((r.stdout or r.stderr).split()).strip()
+        dur = (time.perf_counter() - t0) * 1000.0
         if r.returncode == 0:
+            if lg := execution_logger():
+                lg.log("shell", target=cmd[:120], status="ok", duration_ms=dur)
             return out[:240] if out else "Command finished."
+        if lg := execution_logger():
+            lg.log("shell", target=cmd[:120], status="failed", detail=f"rc={r.returncode}", duration_ms=dur)
         return f"Command exited with code {r.returncode}. {out[:180]}".strip()
     except subprocess.TimeoutExpired:
+        if lg := execution_logger():
+            lg.log("shell", target=cmd[:120], status="timeout", duration_ms=20000.0)
         return "That command timed out after 20 seconds."
     except Exception as err:
+        if lg := execution_logger():
+            lg.log("shell", target=cmd[:120], status="error", detail=str(err)[:120])
         return f"Command failed: {err}"
 
 
@@ -1670,6 +1997,8 @@ def read_webpage(url):
         parser = _TextHTMLParser()
         parser.feed(raw)
         text = " ".join(parser.parts)
+        if text and (s := session_ctx()):
+            s.record_url(u)
         return text[:4000] if text else "The page had no readable text."
     except Exception as err:
         return f"I couldn't read that page ({err})."
@@ -2082,6 +2411,17 @@ def inspect_screen(question="Describe what is currently on my screen and help wi
     return ask_ai_vision(question, img_b64, mime)
 
 
+def _tool_task_status(action="list"):
+    tm = task_manager()
+    if not tm:
+        return "Task manager is unavailable."
+    act = (action or "list").strip().lower()
+    if act in ("cancel", "stop"):
+        n = tm.cancel()
+        return f"Cancelled {n} background task{'s' * (n != 1)}." if n else "No active background tasks to cancel."
+    return tm.summary_text()
+
+
 TOOLS = [
     _tool("open_app_or_website", "Open an app, folder, website or file by name.", {"name": "string"}),
     _tool("list_installed_apps", "List or search applications installed on the user's Windows laptop.", {"query?": "string"}),
@@ -2099,6 +2439,7 @@ TOOLS = [
     _tool("list_tasks", "Read the open to-do tasks.", {}),
     _tool("complete_task", "Mark a to-do task done by its number.", {"number": "number"}),
     _tool("find_files", "Find files by words in their name.", {"query": "string"}),
+    _tool("read_document", "Read or extract text from a local document (.txt, .md, .csv, .json, .docx).", {"target?": "string"}),
     _tool("read_clipboard", "Get the text currently copied on the clipboard.", {}),
     _tool("take_note", "Save a note for the user.", {"text": "string"}),
     _tool("read_notes", "Read the user's recent saved notes.", {"count?": "number"}),
@@ -2114,6 +2455,7 @@ TOOLS = [
     _tool("system_diagnostics", "Detailed live diagnostics: RAM usage, uptime, battery, and disk space.", {}),
     _tool("top_processes", "List the running apps using the most RAM.", {"count?": "number"}),
     _tool("read_webpage", "Fetch readable text from an http or https URL.", {"url": "string"}),
+    _tool("task_status", "Check running/recent background tasks or cancel them (action: 'list' or 'cancel').", {"action?": "string"}),
     _tool("run_routine", "Execute a saved multi-step routine by name (e.g. focus mode, break time).", {"name": "string"}),
     _tool("save_routine", "Create or update a named multi-step routine.", {"name": "string", "steps_csv": "string"}),
     _tool("list_routines", "List available routines.", {}),
@@ -2145,6 +2487,7 @@ FUNCS = {
     "list_tasks": lambda: ctx["list_tasks"](),
     "complete_task": lambda number: ctx["change_task"](int(number)),
     "find_files": find_files_text,
+    "read_document": read_document,
     "read_clipboard": lambda: clipboard() or "The clipboard is empty.",
     "take_note": take_note,
     "read_notes": lambda count=3: read_notes(int(count)),
@@ -2158,6 +2501,7 @@ FUNCS = {
     "system_diagnostics": system_diagnostics,
     "top_processes": lambda count=3: top_processes(int(count)),
     "read_webpage": read_webpage,
+    "task_status": _tool_task_status,
     "run_routine": run_routine,
     "save_routine": lambda name, steps_csv: save_routine(name, [s.strip() for s in re.split(r"[,;\n]+", steps_csv)]),
     "list_routines": list_routines,
@@ -2173,7 +2517,7 @@ FUNCS = {
 }
 
 
-def _system():
+def _system(query=""):
     base = (f"You are {get_assistant_name()}, a sharp, Jarvis-like personal AI assistant living on the user's Windows laptop. "
             "Your replies are spoken aloud: answer in one to three short sentences, in plain words, "
             "with no markdown, lists, links or emojis. Use the tools to act on the laptop when asked, "
@@ -2189,9 +2533,15 @@ def _system():
     uname = get_user_name()
     if uname:
         base += f"\nThe user's name is {uname}."
+    if s := session_ctx():
+        sc = s.summary_prompt()
+        if sc:
+            base += "\n" + sc
+    if (tm := task_manager()) and tm.active():
+        base += "\n" + tm.summary_text()
     m = _memory()
     if m:
-        mem_ctx = m.context_summary()
+        mem_ctx = m.context_summary(query=query)
         if mem_ctx:
             base += "\n\n" + mem_ctx
     return base
@@ -2201,36 +2551,159 @@ def _run_tool(name, args):
     fn = FUNCS.get(name)
     if not fn:
         return f"Unknown tool: {name}"
+    t0 = time.perf_counter()
     try:
-        return str(fn(**(args or {})))
+        out = str(fn(**(args or {})))
+        if lg := execution_logger():
+            lg.log(f"tool:{name}", target=str(args)[:80], duration_ms=(time.perf_counter() - t0) * 1000.0)
+        return out
     except Exception as err:
+        if lg := execution_logger():
+            lg.log(f"tool:{name}", target=str(args)[:80], status="error", detail=str(err)[:100])
         return f"Error: {err}"
+
+
+class _ConnPool:
+    """Thread-safe HTTP/HTTPS keep-alive connection pool to eliminate cold TLS stalls."""
+
+    def __init__(self, max_per_host=4, idle_ttl=55.0):
+        self.max_per_host = max_per_host
+        self.idle_ttl = idle_ttl
+        self._lock = threading.Lock()
+        self._pool = {}
+
+    def _acquire(self, scheme, host, port, timeout):
+        key = (scheme, host, port)
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._pool.get(key) or []
+            while bucket:
+                conn, ts = bucket.pop()
+                if now - ts < self.idle_ttl and conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                    return conn
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        if scheme == "https":
+            return http.client.HTTPSConnection(host, port, timeout=timeout)
+        return http.client.HTTPConnection(host, port, timeout=timeout)
+
+    def _release(self, scheme, host, port, conn, will_close=False):
+        if will_close or conn.sock is None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        key = (scheme, host, port)
+        with self._lock:
+            bucket = self._pool.setdefault(key, [])
+            if len(bucket) >= self.max_per_host:
+                old, _ = bucket.pop(0)
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            bucket.append((conn, time.monotonic()))
+
+    def open_response(self, method, url, data=None, headers=None, timeout=30):
+        parsed = urllib.parse.urlsplit(url)
+        scheme = (parsed.scheme or "https").lower()
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if scheme == "https" else 80)
+        path = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+        hdrs = dict(headers or {})
+        if not any(k.lower() == "user-agent" for k in hdrs):
+            hdrs["User-Agent"] = "Nova/1.0"
+        if not any(k.lower() == "connection" for k in hdrs):
+            hdrs["Connection"] = "keep-alive"
+        if data is not None and not any(k.lower() == "content-type" for k in hdrs):
+            hdrs["Content-Type"] = "application/json"
+
+        last_err = None
+        for _ in range(2):
+            conn = self._acquire(scheme, host, port, timeout)
+            try:
+                conn.request(method, path, body=data, headers=hdrs)
+                resp = conn.getresponse()
+                return conn, resp, scheme, host, port
+            except (http.client.HTTPException, OSError) as err:
+                last_err = err
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        raise last_err
+
+
+_conn_pool = _ConnPool()
+atexit.register(lambda: None)
 
 
 def _http_json(url, payload=None, headers=None, timeout=30):
     hdrs = {"User-Agent": "Nova/1.0", **(headers or {})}
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=hdrs,
-                                 method="POST" if payload is not None else "GET")
+    method = "POST" if payload is not None else "GET"
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme in urllib.request.getproxies():
+        req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {err.code}: {body[:300]}") from err
+    conn, resp, sch, host, port = _conn_pool.open_response(method, url, data, hdrs, timeout)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {err.code}: {body[:300]}") from err
+        raw = resp.read()
+        close_it = resp.will_close or resp.getheader("connection", "").lower() == "close"
+        _conn_pool._release(sch, host, port, conn, will_close=close_it)
+    except Exception:
+        _conn_pool._release(sch, host, port, conn, will_close=True)
+        raise
+    if resp.status >= 400:
+        body = raw.decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {resp.status}: {body[:300]}")
+    return json.loads(raw.decode("utf-8"))
 
 
 def _http_stream(url, payload, headers=None, timeout=45):
-    """Yield decoded text lines from a streaming HTTP POST (SSE or NDJSON)."""
+    """Yield decoded text lines from a streaming HTTP POST (SSE or NDJSON) using pooled TLS."""
     hdrs = {"User-Agent": "Nova/1.0", **(headers or {})}
-    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=hdrs, method="POST")
+    data = json.dumps(payload).encode("utf-8")
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme in urllib.request.getproxies():
+        req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                for raw in resp:
+                    yield raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        except urllib.error.HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {err.code}: {body[:300]}") from err
+        return
+    conn, resp, sch, host, port = _conn_pool.open_response("POST", url, data, hdrs, timeout)
+    completed = False
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            for raw in resp:
-                yield raw.decode("utf-8", errors="replace").rstrip("\r\n")
-    except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {err.code}: {body[:300]}") from err
+        if resp.status >= 400:
+            raw = resp.read()
+            body = raw.decode("utf-8", errors="replace")
+            completed = True
+            _conn_pool._release(sch, host, port, conn, will_close=resp.will_close)
+            raise RuntimeError(f"HTTP {resp.status}: {body[:300]}")
+        while True:
+            raw = resp.readline()
+            if not raw:
+                break
+            yield raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        completed = True
+        close_it = resp.will_close or resp.getheader("connection", "").lower() == "close"
+        _conn_pool._release(sch, host, port, conn, will_close=close_it)
+    finally:
+        if not completed:
+            _conn_pool._release(sch, host, port, conn, will_close=True)
 
 
 class _SentenceEmitter:
@@ -2247,8 +2720,8 @@ class _SentenceEmitter:
         self.all.append(token)
         self.buf += token
         while True:
-            m = re.match(r"^(.{24,}?[.!?])(?:\s+|\n+)(.*)$", self.buf, re.S)
-            if m and not re.search(r"\b\d+\.$", m.group(1)):
+            m = re.match(r"^(.{14,}?[.!?])(?:\s+|\n+)(.*)$", self.buf, re.S)
+            if m and not re.search(r"(?:\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc)|\b\d+)\.$", m.group(1)):
                 sent = " ".join(m.group(1).split())
                 self.buf = m.group(2)
                 if sent:
@@ -2256,12 +2729,12 @@ class _SentenceEmitter:
                 continue
             if "\n" in self.buf:
                 head, _, rest = self.buf.partition("\n")
-                if len(head.strip()) >= 24:
+                if len(head.strip()) >= 16:
                     self.buf = rest
                     self.emit(" ".join(head.split()))
                     continue
-            if len(self.buf) >= 160:
-                cut = self.buf.rfind(" ", 80, 155)
+            if len(self.buf) >= 140:
+                cut = self.buf.rfind(" ", 70, 135)
                 if cut > 0:
                     head = " ".join(self.buf[:cut].split())
                     self.buf = self.buf[cut + 1:]
@@ -2286,7 +2759,7 @@ def _ask_anthropic_stream(text, key, model, base_url, on_sentence, stop_event=No
         blocks = {}
         stop_reason = None
         for line in _http_stream(f"{base_url}/messages",
-                                 {"model": model, "max_tokens": 400, "system": _system(),
+                                 {"model": model, "max_tokens": 400, "system": _system(text),
                                   "tools": TOOLS, "messages": msgs, "stream": True}, headers):
             if stop_event and stop_event.is_set():
                 return " ".join("".join(emitter.all).split()).strip()
@@ -2347,7 +2820,7 @@ def _tools_unsupported(err):
 
 
 def _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event=None):
-    msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
+    msgs = [{"role": "system", "content": _system(text)}] + _history + [{"role": "user", "content": text}]
     headers = _openai_headers(key, base_url)
     tools = _openai_tools()
     use_tools = True
@@ -2401,7 +2874,7 @@ def _ask_openai_stream(text, key, model, base_url, on_sentence, stop_event=None)
 
 
 def _ask_ollama_stream(text, model, base_url, on_sentence, stop_event=None):
-    msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
+    msgs = [{"role": "system", "content": _system(text)}] + _history + [{"role": "user", "content": text}]
     headers = {"Content-Type": "application/json"}
     tools = _openai_tools()
     use_tools = True
@@ -2446,7 +2919,7 @@ def _ask_anthropic(text, key, model, base_url):
         client = anthropic.Anthropic(api_key=key)
         msgs = _history + [{"role": "user", "content": text}]
         for _ in range(5):
-            r = client.messages.create(model=model, max_tokens=400, system=_system(),
+            r = client.messages.create(model=model, max_tokens=400, system=_system(text),
                                        tools=TOOLS, messages=msgs)
             if r.stop_reason != "tool_use":
                 break
@@ -2461,7 +2934,7 @@ def _ask_anthropic(text, key, model, base_url):
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
         for _ in range(5):
             r = _http_json(f"{base_url}/messages",
-                           {"model": model, "max_tokens": 400, "system": _system(),
+                           {"model": model, "max_tokens": 400, "system": _system(text),
                             "tools": TOOLS, "messages": msgs}, headers)
             blocks = r.get("content", [])
             if r.get("stop_reason") != "tool_use":
@@ -2482,7 +2955,7 @@ def _openai_tools():
 
 
 def _ask_openai(text, key, model, base_url):
-    msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
+    msgs = [{"role": "system", "content": _system(text)}] + _history + [{"role": "user", "content": text}]
     headers = _openai_headers(key, base_url)
     tools = _openai_tools()
     use_tools = True
@@ -2536,7 +3009,7 @@ def _ask_gemini(text, key, model, base_url):
     url = f"{base_url}/models/{urllib.parse.quote(model)}:generateContent"
     for _ in range(5):
         r = _http_json(url, {
-            "systemInstruction": {"parts": [{"text": _system()}]},
+            "systemInstruction": {"parts": [{"text": _system(text)}]},
             "contents": contents,
             "tools": tools,
             "generationConfig": {"maxOutputTokens": 400},
@@ -2555,7 +3028,7 @@ def _ask_gemini(text, key, model, base_url):
 
 
 def _ask_ollama(text, model, base_url):
-    msgs = [{"role": "system", "content": _system()}] + _history + [{"role": "user", "content": text}]
+    msgs = [{"role": "system", "content": _system(text)}] + _history + [{"role": "user", "content": text}]
     headers = {"Content-Type": "application/json"}
     tools = _openai_tools()
     use_tools = True
@@ -2666,7 +3139,7 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
     try:
         if provider == "anthropic":
             r = _http_json(f"{base_url}/messages", {
-                "model": model, "max_tokens": 400, "system": _system(),
+                "model": model, "max_tokens": 400, "system": _system(question),
                 "messages": [{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": mime, "data": image_b64}},
                     {"type": "text", "text": question},
@@ -2677,7 +3150,7 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
             r = _http_json(f"{base_url}/chat/completions", {
                 "model": model, "max_tokens": 400,
                 "messages": [
-                    {"role": "system", "content": _system()},
+                    {"role": "system", "content": _system(question)},
                     {"role": "user", "content": [
                         {"type": "text", "text": question},
                         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},
@@ -2688,7 +3161,7 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
         elif provider == "gemini":
             url = f"{base_url}/models/{urllib.parse.quote(model)}:generateContent"
             r = _http_json(url, {
-                "systemInstruction": {"parts": [{"text": _system()}]},
+                "systemInstruction": {"parts": [{"text": _system(question)}]},
                 "contents": [{"role": "user", "parts": [
                     {"inlineData": {"mimeType": mime, "data": image_b64}},
                     {"text": question},
@@ -2701,7 +3174,7 @@ def ask_ai_vision(question, image_b64, mime="image/jpeg"):
             r = _http_json(f"{base_url}/api/chat", {
                 "model": model, "stream": False,
                 "messages": [
-                    {"role": "system", "content": _system()},
+                    {"role": "system", "content": _system(question)},
                     {"role": "user", "content": question, "images": [image_b64]},
                 ],
             }, {"Content-Type": "application/json"}, timeout=60)
@@ -2940,8 +3413,140 @@ def dictate(raw, t):
     return None
 
 
-def route(t, raw):
-    """Match a cleaned command to an ability. Returns a reply, or None if it's not mine."""
+_COMPOUND_VERB_RE = re.compile(
+    r"^(?:open|launch|start|close|quit|check|tell|what(?:'s| is)|how|set|turn|mute|unmute|"
+    r"find|show|list|take|read|summari[sz]e|play|pause|skip|next|lock|minimi[sz]e|maximi[sz]e|"
+    r"switch|copy|paste|refresh)\b"
+)
+_NO_SPLIT_RE = re.compile(
+    r"^(?:create|save|add|make|run|start|delete|remember|remind|take|write|jot|note|type|schedule|book|alarm)\b"
+)
+
+
+def _open_contextual(t):
+    s = session_ctx()
+    if not s:
+        return None
+    idx = ctx_mod.extract_ordinal(t) if ctx_mod else None
+    wants_result = any(w in t for w in ("result", "link", "page"))
+    if wants_result and not s.last_results and s.last_search_query:
+        _search_ready.wait(timeout=1.5)
+    if idx is not None:
+        if wants_result or (s.last_results and not s.last_files):
+            if 0 <= idx < len(s.last_results):
+                item = s.last_results[idx]
+                webbrowser.open(item["url"])
+                s.record_url(item["url"])
+                return f"Opening {item['title'] or item['url']}."
+            return f"I only have {len(s.last_results)} search results."
+        if 0 <= idx < len(s.last_files):
+            p = Path(s.last_files[idx])
+            open_path(p)
+            s.record_files([p])
+            return f"Opening {p.name}."
+    if re.fullmatch(r"open\s+(?:it|that|this|that file|this file|that link|that page|that folder)", t):
+        if s.last_file and Path(s.last_file).exists():
+            p = Path(s.last_file)
+            open_path(p)
+            return f"Opening {p.name}."
+        if s.last_results:
+            item = s.last_results[0]
+            webbrowser.open(item["url"])
+            s.record_url(item["url"])
+            return f"Opening {item['title'] or item['url']}."
+        if s.last_url:
+            webbrowser.open(s.last_url)
+            return f"Opening {s.last_url}."
+        if s.last_folder and Path(s.last_folder).exists():
+            open_path(s.last_folder)
+            return f"Opening your {Path(s.last_folder).name} folder."
+        return "I don't have a recent file or link in context."
+    return None
+
+
+def _summarize_contextual(t):
+    s = session_ctx()
+    idx = ctx_mod.extract_ordinal(t) if ctx_mod else None
+    body = ""
+    if s and (any(w in t for w in ("result", "link", "page", "article", "site"))
+              or (not s.last_file and (s.last_results or s.last_url))):
+        if not s.last_results and s.last_search_query:
+            _search_ready.wait(timeout=1.5)
+        url = ""
+        if idx is not None and 0 <= idx < len(s.last_results):
+            url = s.last_results[idx]["url"]
+        elif s.last_url:
+            url = s.last_url
+        elif s.last_results:
+            url = s.last_results[0]["url"]
+        if url:
+            body = read_webpage(url)
+    elif s and (s.last_file or s.last_files):
+        fpath = s.last_files[idx] if (idx is not None and 0 <= idx < len(s.last_files)) else s.last_file
+        if fpath:
+            body = read_document(fpath)
+    if not body:
+        body = clipboard()
+    if not body:
+        return "I don't have a recent document, webpage, or clipboard text to summarize."
+    if body.startswith(("I couldn't ", "Found ", "For security")):
+        return body
+    if ai_ready() and not ai_blocked():
+        ans = ask_ai(f"Summarize this concisely in two or three short spoken sentences:\n\n{body[:6000]}")
+        if ans:
+            return ans
+    sents = re.split(r"(?<=[.!?])\s+", " ".join(body.split()))
+    return " ".join(sents[:2])[:320] if sents else body[:320]
+
+
+def route(t, raw, on_ack=None):
+    """Match a cleaned command (or safe parallel compound command) to local abilities."""
+    if ctx_mod and not _NO_SPLIT_RE.match(t) and "routine" not in t:
+        clauses = ctx_mod.split_compound(t, raw)
+        if len(clauses) >= 2 and all(_COMPOUND_VERB_RE.match(ct) for ct, _ in clauses):
+            if on_ack:
+                on_ack("Working on that.")
+            tm = task_manager()
+            if tm:
+                recs = tm.run_parallel([(ct, lambda c1=ct, c2=craw: _route_single(c1, c2)) for ct, craw in clauses])
+                outs = [r.result for r in recs if r.status == tasks_mod.TaskStatus.COMPLETED and r.result]
+                if len(outs) == len(clauses):
+                    return " ".join(str(x).strip() for x in outs)
+            else:
+                outs = [_route_single(ct, craw) for ct, craw in clauses]
+                if all(o is not None for o in outs):
+                    return " ".join(str(x).strip() for x in outs)
+    return _route_single(t, raw)
+
+
+def _route_single(t, raw):
+    """Match a single cleaned command to an ability. Returns a reply, or None if it's not mine."""
+    # --- task manager, performance telemetry & memory controls ---
+    if re.search(
+        r"\b(?:what|which|list|show|check)\b.*\b(?:background\s+tasks?|running\s+tasks?|active\s+tasks?|task\s+status|tasks?\s+(?:are|that are|currently)\s+running)\b|^task status$",
+        t,
+    ):
+        return _tool_task_status("list")
+    if re.search(r"\b(?:cancel|stop|abort)\b.*\b(?:current\s+task|background\s+tasks?|running\s+tasks?|tasks?)\b", t):
+        return _tool_task_status("cancel")
+    if re.search(r"\b(?:performance|latency|speed)\s+(?:stats|metrics|report)\b|\bhow fast (?:are you|were you)\b", t):
+        return perf_monitor().report_text() if perf_monitor() else "Performance stats are unavailable."
+    if re.search(r"\bmemory stats\b|\bhow many memories\b", t):
+        m = _memory()
+        if not m:
+            return "Memory is unavailable."
+        st = m.stats()
+        return f"I have {st['facts']} saved facts, {st['episodes']} recent episodes, and {st['summaries']} summaries."
+    if re.search(r"\b(?:compact|clean up|consolidate)\b.*\bmemor(?:y|ies)\b", t):
+        m = _memory()
+        if not m:
+            return "Memory is unavailable."
+        n = m.compact_episodes()
+        return f"Compacted {n} older conversation episodes into a summary." if n else "Memory is already compact."
+    if m := re.match(r"pin\s+(?:the\s+|that\s+)?(?:fact\s+|memory\s+)?(.+)", t):
+        if _memory():
+            return "Pinned that in long-term memory." if _memory().pin_fact(m.group(1), True) else "I couldn't find that memory to pin."
+
     # --- routines, mic calibration & dev commands ---
     if re.search(r"\b(recalibrate|calibrate)\b.*\b(mic|microphone|noise)\b", t):
         return ctx["recalibrate"]() if "recalibrate" in ctx else "Microphone calibration is only available in voice mode."
@@ -2962,6 +3567,11 @@ def route(t, raw):
         return github_status()
     if m := re.search(r"(?:^|\s)(?:run|execute)\s+(?:the\s+)?command\s+(.+)$", raw.strip(), re.I):
         cmd = m.group(1).strip()
+        ok, reason = _validate_shell_cmd(cmd)
+        if not ok:
+            if lg := execution_logger():
+                lg.log("shell", target=cmd[:120], status="blocked", detail=reason)
+            return reason
         return confirm(f"Run command {cmd}?", lambda: _exec_shell(cmd))
 
     # --- calendar & agenda ---
@@ -3213,11 +3823,31 @@ def route(t, raw):
         return system_diagnostics()
     if re.search(r"\bsystem status\b", t):
         return system_status()
+    if re.search(r"\bwhat('s| is)? the time\b|\bwhat time\b|\bcurrent time\b|\bthe time\b", t):
+        return f"It's {datetime.now().strftime('%I:%M %p').lstrip('0')}."
+    if re.search(r"\b(what('s| is)? the date|what day|today's date|the date)\b", t):
+        n = datetime.now()
+        return f"Today is {n:%A}, {n:%B} {n.day}."
     if re.search(r"\b(weather|forecast|will it rain|is it going to rain)\b", t):
         m = re.search(r"\bin ([a-z ]+)$", t)
         return weather(m.group(1).strip() if m else "")
 
-    # --- files ---
+    # --- files, context follow-ups & documents ---
+    if m := re.match(r"(?:check|list|show|what(?:'s| is) in)\s+(?:my\s+|the\s+)?(downloads|desktop|documents|pictures|videos|music)(?:\s+folder)?$", t):
+        return check_folder_text(folder_from(m.group(1)))
+    if m := re.match(
+        r"(?:find|get|show|locate|what(?:'s| is))\s+(?:the\s+|my\s+)?(?:latest|newest|most recent|last)\s+"
+        r"(pdf|word|doc|excel|spreadsheet|powerpoint|presentation|image|photo|picture|screenshot|video|audio|music|zip|archive|installer|document|file)s?"
+        r"(?:\s+(?:in|on)\s+(?:my\s+|the\s+)?(\w+))?$",
+        t,
+    ):
+        return find_latest_type(m.group(1), m.group(2) or "")
+    if m := re.match(r"(?:read|extract|show text of)\s+(?:the\s+|this\s+|that\s+|my\s+)?(?:document|file)\s+(.+)$|^read\s+(.+\.(?:txt|md|csv|json|log|docx|pdf))$", t):
+        return read_document((m.group(1) or m.group(2) or "").strip())
+    if re.fullmatch(r"read\s+(?:it|that|this|that document|that file|the document|the file)", t):
+        return read_document("it")
+    if re.match(r"summari[sz]e\s+(?:it|that|this|this (?:document|file|page|article)|that (?:document|file|page|article)|the (?:document|file|article)|(?:the )?(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+(?:result|one|link|file))$", t):
+        return _summarize_contextual(t)
     if re.search(r"\b(biggest|largest)\b.*\bfiles?\b", t):
         return biggest()
     if m := re.search(r"\b(?:create|make|new) (?:a |new )*folder (?:called |named )?(.+?)"
@@ -3252,8 +3882,10 @@ def route(t, raw):
             return r
 
     # --- web and opening things ---
-    if m := re.match(r"(?:google|look up|search (?:the web|online|google)(?: for)?)\s+(.+)", t):
+    if m := re.match(r"(?:google|look up|search (?:the web|online|google)(?: for)?|search for(?!\s+(?:files?|documents?|my files?)\b))\s+(.+)", t):
         return web_search(m.group(1))
+    if ctx_resp := _open_contextual(t):
+        return ctx_resp
     if m := re.match(r"(?:open|launch|start|go to|visit)\s+(.+)", t):
         return open_thing(m.group(1))
     return None

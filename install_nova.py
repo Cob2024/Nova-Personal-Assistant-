@@ -24,6 +24,8 @@ RUNTIME_FILES = (
     "nova_voice.py",
     "nova_memory.py",
     "nova_calendar.py",
+    "nova_tasks.py",
+    "nova_context.py",
     "install_nova.py",
     "Install_Nova.bat",
     ".env.example",
