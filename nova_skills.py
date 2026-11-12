@@ -1562,7 +1562,7 @@ def read_document(target=""):
             return text[:8000] if text else f"{path.name} appears to be empty."
         if suf == ".pdf":
             try:
-                import pypdf
+                import pypdf  # pyright: ignore[reportMissingImports]
                 reader = pypdf.PdfReader(str(path))
                 text = " ".join((page.extract_text() or "") for page in reader.pages[:6])
                 text = " ".join(text.split())
@@ -2280,11 +2280,11 @@ def capture_screen_b64(max_dim=1280):
     if not IS_WIN:
         return None, None
     try:
-        from PIL import ImageGrab
+        from PIL import ImageGrab  # pyright: ignore[reportMissingImports]
         img = ImageGrab.grab().convert("RGB")
     except Exception:
         try:
-            from PIL import Image
+            from PIL import Image  # pyright: ignore[reportMissingImports]
             tmp = DATA / "_screen_tmp.png"
             ps("Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
                "$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds;"
@@ -2915,7 +2915,7 @@ def _ask_ollama_stream(text, model, base_url, on_sentence, stop_event=None):
 
 def _ask_anthropic(text, key, model, base_url):
     try:
-        import anthropic
+        import anthropic  # pyright: ignore[reportMissingImports]
         client = anthropic.Anthropic(api_key=key)
         msgs = _history + [{"role": "user", "content": text}]
         for _ in range(5):
@@ -3842,8 +3842,13 @@ def _route_single(t, raw):
         t,
     ):
         return find_latest_type(m.group(1), m.group(2) or "")
-    if m := re.match(r"(?:read|extract|show text of)\s+(?:the\s+|this\s+|that\s+|my\s+)?(?:document|file)\s+(.+)$|^read\s+(.+\.(?:txt|md|csv|json|log|docx|pdf))$", t):
-        return read_document((m.group(1) or m.group(2) or "").strip())
+    if (m := re.match(r"(?:read|extract|show text of)\s+(?:the\s+|this\s+|that\s+|my\s+)?(?:document|file)\s+(.+)$", t)) \
+            or (m := re.match(r"^(?:read|open and read)\s+(.+\.(?:txt|md|csv|json|log|docx|pdf))$", raw.strip(), re.I)) \
+            or (m := re.match(r"^read\s+(.+\s+(?:txt|md|csv|json|log|docx|pdf))$", t)):
+        target_doc = m.group(1).strip()
+        if re.search(r"\s+(?:txt|md|csv|json|log|docx|pdf)$", target_doc) and "." not in target_doc:
+            target_doc = re.sub(r"\s+(txt|md|csv|json|log|docx|pdf)$", r".\1", target_doc)
+        return read_document(target_doc)
     if re.fullmatch(r"read\s+(?:it|that|this|that document|that file|the document|the file)", t):
         return read_document("it")
     if re.match(r"summari[sz]e\s+(?:it|that|this|this (?:document|file|page|article)|that (?:document|file|page|article)|the (?:document|file|article)|(?:the )?(?:first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\s+(?:result|one|link|file))$", t):
